@@ -1,0 +1,20 @@
+[Unit]
+Description=ALMPlatform Celery Beat Scheduler
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=almplatform
+Group=almplatform
+WorkingDirectory=/app
+EnvironmentFile=/app/.env
+ExecStart=/app/venv/bin/celery -A backend.workers.celery_app beat --loglevel=info
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=almapp-beat
+
+[Install]
+WantedBy=multi-user.target

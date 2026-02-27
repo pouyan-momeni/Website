@@ -1,0 +1,20 @@
+[Unit]
+Description=ALMPlatform Celery Worker
+After=network.target redis.service postgresql.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=almplatform
+Group=almplatform
+WorkingDirectory=/app
+EnvironmentFile=/app/.env
+ExecStart=/app/venv/bin/celery -A backend.workers.celery_app worker --loglevel=info --concurrency=4
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=almapp-worker
+
+[Install]
+WantedBy=multi-user.target

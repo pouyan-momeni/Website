@@ -1,0 +1,15 @@
+[Unit]
+Description=Redis Server for ALMPlatform
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/redis-server --bind 127.0.0.1 --port 6379 --maxmemory 2gb --maxmemory-policy allkeys-lru
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=almapp-redis
+
+[Install]
+WantedBy=multi-user.target

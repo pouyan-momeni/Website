@@ -1,0 +1,20 @@
+[Unit]
+Description=ALMPlatform API (FastAPI via Uvicorn)
+After=network.target postgresql.service redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=almplatform
+Group=almplatform
+WorkingDirectory=/app
+EnvironmentFile=/app/.env
+ExecStart=/app/venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 4 --log-level info
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=almapp-api
+
+[Install]
+WantedBy=multi-user.target
