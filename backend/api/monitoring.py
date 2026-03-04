@@ -25,25 +25,39 @@ async def get_containers(
     current_user: User = Depends(require_role(["admin", "developer", "runner"])),
 ):
     """List running Docker containers managed by this app. Runner+ role required."""
-    # Dev mode: simulate containers from running dev runs
+    # Dev mode: simulate containers from running DB runs
     if settings.is_develop:
-        from backend.api.runs import _DEV_RUNS, _get_model_name
-        containers = []
-        for run_id, run in _DEV_RUNS.items():
-            if run["status"] == "running":
-                model_name = _get_model_name(run["model_id"])
+        from sqlalchemy import select, create_engine
+        from sqlalchemy.orm import Session, sessionmaker
+        from backend.models.run import Run
+        from backend.models.model import Model
+
+        sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+        SyncSessionLocal = sessionmaker(bind=sync_engine)
+        db = SyncSessionLocal()
+        try:
+            running_runs = db.execute(
+                select(Run).where(Run.status == "running")
+            ).scalars().all()
+
+            containers = []
+            for run in running_runs:
+                model = db.execute(select(Model).where(Model.id == run.model_id)).scalar_one_or_none()
+                model_name = model.name if model else "Unknown"
                 container_names = ["data-updater", "analyze", "backtest"]
-                idx = min(run.get("current_container_index", 0), len(container_names) - 1)
+                idx = min(run.current_container_index or 0, len(container_names) - 1)
                 containers.append(ContainerInfo(
-                    docker_id=run_id[:12],
-                    name=f"almplatform-{run_id[:8]}-{container_names[idx]}",
+                    docker_id=str(run.id)[:12],
+                    name=f"almplatform-{str(run.id)[:8]}-{container_names[idx]}",
                     image=f"alm/{container_names[idx]}:latest",
                     status="running",
-                    run_id=run_id,
-                    started_at=run.get("started_at"),
-                    memory_usage_mb=round(128 + hash(run_id) % 256, 2),
+                    run_id=str(run.id),
+                    started_at=run.started_at.isoformat() if run.started_at else None,
+                    memory_usage_mb=round(128 + hash(str(run.id)) % 256, 2),
                 ))
-        return containers
+            return containers
+        finally:
+            db.close()
 
     runner = DockerRunner()
     containers = runner.list_running_containers()

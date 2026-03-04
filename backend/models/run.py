@@ -44,4 +44,4 @@ class Run(Base):
     model = relationship("Model", back_populates="runs")
     user = relationship("User", back_populates="runs", foreign_keys=[triggered_by])
     containers = relationship("RunContainer", back_populates="run", cascade="all, delete-orphan")
-    notifications = relationship("Notification", back_populates="run")
+    notifications = relationship("Notification", back_populates="run", cascade="all, delete-orphan")

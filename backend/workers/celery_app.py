@@ -46,4 +46,11 @@ celery_app.conf.update(
 )
 
 # Auto-discover tasks in the workers package
-celery_app.autodiscover_tasks(["backend.workers"])
+celery_app.conf.update(
+    imports=[
+        "backend.workers.execute_run",
+        "backend.workers.scheduler",
+        "backend.workers.cleanup",
+        "backend.workers.alerting",
+    ]
+)

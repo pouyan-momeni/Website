@@ -20,7 +20,7 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
 # Docker
-docker==7.0.0
+docker==7.1.0
 
 # Monitoring
 psutil==5.9.8
@@ -33,4 +33,8 @@ pydantic==2.6.1
 pydantic-settings==2.1.0
 python-dotenv==1.0.1
 httpx==0.27.0
-websockets==12.0
+websockets>=14.2.0
+
+# Notebooks
+marimo>=0.17.0
+pandas>=2.1.0

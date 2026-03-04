@@ -1,0 +1,12 @@
+{
+  "run_id": "3658279f-b391-439f-889b-af755f97e180",
+  "model": "Liquidity Model",
+  "completed_at": "2026-03-03T20:00:30.740783+00:00",
+  "status": "completed",
+  "metrics": {
+    "total_pnl": 75679,
+    "var_95": 5746,
+    "sharpe_ratio": 2.09,
+    "max_drawdown_pct": 6.55
+  }
+}

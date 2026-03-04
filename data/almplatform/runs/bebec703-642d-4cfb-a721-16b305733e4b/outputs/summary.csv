@@ -1,0 +1,6 @@
+metric,value,status
+Total PnL,"$46,044",pass
+VaR 95%,"$6,601",pass
+Expected Shortfall,"$18,560",warning
+Max Drawdown,10.46%,pass
+Sharpe Ratio,1.15,pass

@@ -43,9 +43,9 @@ def upgrade() -> None:
         sa.Column("name", sa.Text(), nullable=False),
         sa.Column("slug", sa.Text(), nullable=False, unique=True),
         sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("docker_images", postgresql.JSONB(), nullable=False, server_default="'[]'::jsonb"),
-        sa.Column("default_config", postgresql.JSONB(), nullable=False, server_default="'{}'::jsonb"),
-        sa.Column("input_schema", postgresql.JSONB(), nullable=False, server_default="'[]'::jsonb"),
+        sa.Column("docker_images", postgresql.JSONB(), nullable=False, server_default=sa.text("'[]'")),
+        sa.Column("default_config", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'")),
+        sa.Column("input_schema", postgresql.JSONB(), nullable=False, server_default=sa.text("'[]'")),
         sa.Column("created_at", postgresql.TIMESTAMP(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("updated_at", postgresql.TIMESTAMP(timezone=True), nullable=False, server_default=sa.func.now()),
     )

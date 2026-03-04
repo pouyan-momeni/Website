@@ -30,6 +30,6 @@ class User(Base):
     )
 
     # Relationships
-    runs = relationship("Run", back_populates="user", foreign_keys="Run.triggered_by")
-    schedules = relationship("Schedule", back_populates="creator", foreign_keys="Schedule.created_by")
+    runs = relationship("Run", back_populates="user")
+    schedules = relationship("Schedule", back_populates="creator")
     notifications = relationship("Notification", back_populates="user")

@@ -336,6 +336,20 @@ async def create_run(
             inputs=body.inputs,
             config_override=body.config_override,
         )
+
+        # Audit log the run creation
+        from backend.api.audit import log_action
+        model_result = await db.execute(select(Model).where(Model.id == body.model_id))
+        model_obj = model_result.scalar_one_or_none()
+        log_action(
+            username=current_user.ldap_username,
+            user_id=str(current_user.id),
+            action="create_run",
+            resource_type="run",
+            resource_id=str(run.id),
+            details={"model_id": str(body.model_id), "model_name": model_obj.name if model_obj else "Unknown"},
+        )
+
         return run
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -541,6 +555,19 @@ async def cancel_run(
             run["completed_at"] = datetime.now(timezone.utc).isoformat()
             _DEV_LOGS.setdefault(str(run_id), []).append("[system] Run cancelled while queued")
         return {"detail": f"Cancel signal set for run {run_id}"}
+
+    result = await db.execute(select(Run).where(Run.id == run_id))
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+        
+    if run.status in ["completed", "failed", "cancelled"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Run already finished")
+        
+    if run.status == "queued":
+        run.status = "cancelled"
+        run.completed_at = datetime.now(timezone.utc)
+        await db.flush()
 
     redis_client = await get_redis()
     cancel_key = f"run:{run_id}:cancel"

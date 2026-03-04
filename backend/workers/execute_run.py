@@ -277,13 +277,33 @@ def execute_model_run(self, run_id: str) -> dict:
                                 return {"status": "cancelled"}
 
                 except ImageNotFoundError as exc:
-                    last_error = str(exc)
-                    logger.error("Image not found for container '%s': %s", container_name, exc)
-                    run_container.status = "failed"
-                    run_container.exit_code = -1
-                    run_container.completed_at = datetime.now(timezone.utc)
-                    db.commit()
-                    break
+                    if settings.is_develop:
+                        logger.info("Dev mode logic: Simulating successful container '%s'", container_name)
+                        redis_client.publish(
+                            f"run:{run_id}:logs",
+                            f"[{container_name}] (Dev Mode) Simulating container execution..."
+                        )
+                        # Simulate execution time so the run appears in Queue/Monitoring
+                        time.sleep(3)
+                        redis_client.publish(
+                            f"run:{run_id}:logs",
+                            f"[{container_name}] (Dev Mode) Container completed successfully"
+                        )
+                        run_container.docker_container_id = f"dev-mock-{container_name}"
+                        run_container.exit_code = 0
+                        run_container.status = "completed"
+                        run_container.completed_at = datetime.now(timezone.utc)
+                        db.commit()
+                        success = True
+                        break
+                    else:
+                        last_error = str(exc)
+                        logger.error("Image not found for container '%s': %s", container_name, exc)
+                        run_container.status = "failed"
+                        run_container.exit_code = -1
+                        run_container.completed_at = datetime.now(timezone.utc)
+                        db.commit()
+                        break
 
                 except Exception as exc:
                     last_error = str(exc)
@@ -313,6 +333,15 @@ def execute_model_run(self, run_id: str) -> dict:
                 )
                 _send_notification_sync(db, run, "failed")
                 return {"status": "failed", "detail": f"Container '{container_name}' failed: {last_error}"}
+
+        # Generate mock outputs in development mode
+        if settings.is_develop:
+            try:
+                from backend.api.runs import _generate_sample_outputs
+                _generate_sample_outputs(run_id, output_dir, model.name)
+                logger.info("Generated sample outputs for dev run %s", run_id)
+            except Exception as e:
+                logger.error("Failed to generate sample outputs: %s", e)
 
         # All containers completed successfully
         run.status = "completed"

@@ -255,6 +255,14 @@ class ApiClient {
         await this.request(`/notebooks/${id}`, { method: 'DELETE' });
     }
 
+    async getMarimoStatus(): Promise<{ running: boolean; url?: string; port?: number }> {
+        return this.request('/marimo/status');
+    }
+
+    async launchMarimo(): Promise<void> {
+        await this.request('/marimo/launch', { method: 'POST' });
+    }
+
     // Audit
     async getAuditLog(params: string): Promise<{ entries: unknown[]; total: number; page: number; page_size: number }> {
         return this.request(`/audit?${params}`);

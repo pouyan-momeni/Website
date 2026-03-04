@@ -1,0 +1,12 @@
+{
+  "run_id": "3ed410d8-c7df-4a9f-a674-01add4d7fb4a",
+  "model": "ALM Risk Model",
+  "completed_at": "2026-03-03T19:59:55.679877+00:00",
+  "status": "completed",
+  "metrics": {
+    "total_pnl": 51188,
+    "var_95": 10646,
+    "sharpe_ratio": 1.34,
+    "max_drawdown_pct": 2.69
+  }
+}

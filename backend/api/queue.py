@@ -38,9 +38,23 @@ async def get_queue(
 
     runs = await queue_service.get_queue(db)
     response = []
+    
+    from backend.models.model import Model
+    from sqlalchemy import select
+    
     for run in runs:
         run_data = RunListResponse.model_validate(run)
+        
+        # Populate model_name
+        model_result = await db.execute(select(Model.name).where(Model.id == run.model_id))
+        run_data.model_name = model_result.scalar_one_or_none()
+        
+        # Populate username
+        user_result = await db.execute(select(User.ldap_username).where(User.id == run.triggered_by))
+        run_data.username = user_result.scalar_one_or_none()
+        
         response.append(run_data)
+        
     return response
 
 
