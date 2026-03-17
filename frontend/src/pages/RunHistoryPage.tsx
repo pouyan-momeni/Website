@@ -9,6 +9,7 @@ export default function RunHistoryPage() {
     const queryClient = useQueryClient();
     const [filters, setFilters] = useState<Record<string, string>>({});
     const [page, setPage] = useState(0);
+    const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
     const pageSize = 20;
 
     const { data: models } = useQuery({
@@ -36,7 +37,10 @@ export default function RunHistoryPage() {
 
     const deleteMutation = useMutation({
         mutationFn: (id: string) => api.deleteRun(id),
-        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['runs'] }),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['runs'] });
+            setDeleteConfirmId(null);
+        },
     });
 
     const unarchiveMutation = useMutation({
@@ -86,6 +90,28 @@ export default function RunHistoryPage() {
                     className="px-3 py-2 bg-background border border-border rounded-lg text-sm focus:ring-2 focus:ring-primary/50"
                 />
             </div>
+
+            {/* Delete Confirmation Modal */}
+            {deleteConfirmId && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 animate-fade-in">
+                    <div className="bg-card border border-border rounded-xl p-6 max-w-md mx-4 shadow-2xl">
+                        <h3 className="font-semibold text-lg mb-2">Delete Run</h3>
+                        <p className="text-sm text-muted-foreground mb-6">
+                            Are you sure you want to permanently delete this run? This action cannot be undone.
+                        </p>
+                        <div className="flex gap-3 justify-end">
+                            <button onClick={() => setDeleteConfirmId(null)} className="px-4 py-2 border border-border rounded-lg text-sm hover:bg-accent">Cancel</button>
+                            <button
+                                onClick={() => deleteMutation.mutate(deleteConfirmId)}
+                                disabled={deleteMutation.isPending}
+                                className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-500 disabled:opacity-50"
+                            >
+                                {deleteMutation.isPending ? 'Deleting...' : 'Delete Run'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Table */}
             {isLoading ? (
@@ -147,11 +173,7 @@ export default function RunHistoryPage() {
                                                             <Archive className="w-4 h-4" />
                                                         </button>
                                                         <button
-                                                            onClick={() => {
-                                                                if (confirm('Delete this run permanently?')) {
-                                                                    deleteMutation.mutate(run.id);
-                                                                }
-                                                            }}
+                                                            onClick={() => setDeleteConfirmId(run.id)}
                                                             disabled={deleteMutation.isPending}
                                                             className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
                                                             title="Delete permanently"

@@ -1,7 +1,7 @@
 import { useAuthStore } from '../stores/auth';
 import type {
     Model, Run, RunListItem, Schedule, ResourceSnapshot,
-    ContainerInfo, User, TokenResponse, Notebook,
+    ContainerInfo, User, TokenResponse, Notebook, NotebookMonitorInfo,
 } from '../types';
 
 const BASE_URL = '/api';
@@ -125,6 +125,18 @@ class ApiClient {
         });
     }
 
+    async exportModel(modelId: string): Promise<Record<string, unknown>> {
+        return this.request(`/models/${modelId}/export`);
+    }
+
+    async importModel(data: Record<string, unknown>): Promise<Model> {
+        return this.request('/models/import', { method: 'POST', body: JSON.stringify(data) });
+    }
+
+    async deleteModel(modelId: string): Promise<void> {
+        await this.request(`/models/${modelId}`, { method: 'DELETE' });
+    }
+
     // Runs
     async createRun(data: { model_id: string; inputs: Record<string, unknown>; config_override: Record<string, unknown> }): Promise<Run> {
         return this.request('/runs', { method: 'POST', body: JSON.stringify(data) });
@@ -213,6 +225,22 @@ class ApiClient {
         await this.request(`/monitoring/containers/${dockerId}`, { method: 'DELETE' });
     }
 
+    async pauseContainer(dockerId: string): Promise<void> {
+        await this.request(`/monitoring/containers/${dockerId}/pause`, { method: 'POST' });
+    }
+
+    async resumeContainer(dockerId: string): Promise<void> {
+        await this.request(`/monitoring/containers/${dockerId}/resume`, { method: 'POST' });
+    }
+
+    async getMonitoringNotebooks(): Promise<NotebookMonitorInfo[]> {
+        return this.request('/monitoring/notebooks');
+    }
+
+    async stopMonitoringNotebook(notebookId: string): Promise<void> {
+        await this.request(`/monitoring/notebooks/${notebookId}/stop`, { method: 'POST' });
+    }
+
     // Users
     async getUsers(): Promise<User[]> {
         return this.request('/users');
@@ -226,7 +254,7 @@ class ApiClient {
         return this.request(`/users/${userId}/role`, { method: 'PUT', body: JSON.stringify({ role }) });
     }
 
-    async deactivateUser(userId: string): Promise<void> {
+    async deleteUser(userId: string): Promise<void> {
         await this.request(`/users/${userId}`, { method: 'DELETE' });
     }
 
@@ -235,8 +263,24 @@ class ApiClient {
         return this.request('/notebooks');
     }
 
+    async getSharedNotebooks(): Promise<Notebook[]> {
+        return this.request('/notebooks/shared');
+    }
+
     async createNotebook(name: string): Promise<Notebook> {
         return this.request('/notebooks', { method: 'POST', body: JSON.stringify({ name }) });
+    }
+
+    async copySharedNotebook(id: string): Promise<Notebook> {
+        return this.request(`/notebooks/${id}/copy`, { method: 'POST' });
+    }
+
+    async shareNotebook(id: string): Promise<Notebook> {
+        return this.request(`/notebooks/${id}/share`, { method: 'POST' });
+    }
+
+    async unshareNotebook(id: string): Promise<void> {
+        await this.request(`/notebooks/${id}/unshare`, { method: 'POST' });
     }
 
     async startNotebook(id: string): Promise<Notebook> {
@@ -266,6 +310,21 @@ class ApiClient {
     // Audit
     async getAuditLog(params: string): Promise<{ entries: unknown[]; total: number; page: number; page_size: number }> {
         return this.request(`/audit?${params}`);
+    }
+
+    async downloadAuditCsv(params: string): Promise<void> {
+        const token = useAuthStore.getState().accessToken;
+        const res = await fetch(`/api/audit/export-csv?${params}`, {
+            headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (!res.ok) throw new Error('CSV export failed');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `audit_log_${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
     }
 }
 

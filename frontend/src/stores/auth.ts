@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
 import type { User } from '../types';
 
 interface AuthState {
@@ -12,22 +13,29 @@ interface AuthState {
     isDevelop: () => boolean;
 }
 
-export const useAuthStore = create<AuthState>((set, get) => ({
-    accessToken: null,
-    user: null,
-    appMode: null,
+export const useAuthStore = create<AuthState>()(
+    persist(
+        (set, get) => ({
+            accessToken: null,
+            user: null,
+            appMode: null,
 
-    setAuth: (token, user) => set({ accessToken: token, user }),
-    setAppMode: (mode) => set({ appMode: mode }),
-    clearAuth: () => set({ accessToken: null, user: null }),
+            setAuth: (token, user) => set({ accessToken: token, user }),
+            setAppMode: (mode) => set({ appMode: mode }),
+            clearAuth: () => set({ accessToken: null, user: null }),
 
-    hasRole: (roles) => {
-        const { user } = get();
-        return user ? roles.includes(user.role) : false;
-    },
+            hasRole: (roles) => {
+                const { user } = get();
+                return user ? roles.includes(user.role) : false;
+            },
 
-    isDevelop: () => {
-        const { appMode } = get();
-        return appMode === 'develop';
-    },
-}));
+            isDevelop: () => {
+                const { appMode } = get();
+                return appMode === 'develop';
+            },
+        }),
+        {
+            name: 'alm-auth',
+        },
+    ),
+);

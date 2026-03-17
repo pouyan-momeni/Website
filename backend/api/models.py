@@ -1,10 +1,12 @@
 """Models API routes."""
 
 import copy
+import uuid as uuid_mod
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,9 +29,9 @@ _DEV_MODELS: dict[str, dict] = {
         "slug": "interest-rate-model",
         "description": "Models interest rate scenarios, yield curve shifts, and duration risk across the portfolio.",
         "docker_images": [
-            {"name": "data-updater", "image": "alm/ir-data-updater:latest", "order": 1, "env": {"DATA_SOURCE": "bloomberg"}},
-            {"name": "analyze", "image": "alm/ir-analyze:latest", "order": 2, "env": {"SCENARIOS": "1000"}},
-            {"name": "backtest", "image": "alm/ir-backtest:latest", "order": 3, "env": {"LOOKBACK_YEARS": "5"}},
+            {"name": "data-updater", "image": "alm/ir-data-updater:latest", "order": 1, "extra_args": "-e DATA_SOURCE=bloomberg"},
+            {"name": "analyze", "image": "alm/ir-analyze:latest", "order": 2, "extra_args": "-e SCENARIOS=1000"},
+            {"name": "backtest", "image": "alm/ir-backtest:latest", "order": 3, "extra_args": "-e LOOKBACK_YEARS=5"},
         ],
         "default_config": {
             "rate_shock_bps": {"value": 200, "type": "int", "description": "Parallel rate shock in basis points"},
@@ -51,9 +53,9 @@ _DEV_MODELS: dict[str, dict] = {
         "slug": "credit-risk-model",
         "description": "Evaluates credit exposure, probability of default, and loss-given-default across counterparties.",
         "docker_images": [
-            {"name": "data-updater", "image": "alm/cr-data-updater:latest", "order": 1, "env": {"DATA_SOURCE": "internal_db"}},
-            {"name": "analyze", "image": "alm/cr-analyze:latest", "order": 2, "env": {"PD_MODEL": "merton"}},
-            {"name": "backtest", "image": "alm/cr-backtest:latest", "order": 3, "env": {"STRESS_SCENARIOS": "3"}},
+            {"name": "data-updater", "image": "alm/cr-data-updater:latest", "order": 1, "extra_args": "-e DATA_SOURCE=internal_db"},
+            {"name": "analyze", "image": "alm/cr-analyze:latest", "order": 2, "extra_args": "-e PD_MODEL=merton"},
+            {"name": "backtest", "image": "alm/cr-backtest:latest", "order": 3, "extra_args": "-e STRESS_SCENARIOS=3"},
         ],
         "default_config": {
             "lgd_assumption": {"value": 0.45, "type": "float", "description": "Loss given default assumption"},
@@ -76,9 +78,9 @@ _DEV_MODELS: dict[str, dict] = {
         "slug": "liquidity-model",
         "description": "Assesses liquidity coverage ratio, net stable funding ratio, and cash flow projections under stress.",
         "docker_images": [
-            {"name": "data-updater", "image": "alm/liq-data-updater:latest", "order": 1, "env": {"DATA_SOURCE": "treasury_system"}},
-            {"name": "analyze", "image": "alm/liq-analyze:latest", "order": 2, "env": {"PROJECTION_DAYS": "90"}},
-            {"name": "backtest", "image": "alm/liq-backtest:latest", "order": 3, "env": {"STRESS_TYPE": "idiosyncratic"}},
+            {"name": "data-updater", "image": "alm/liq-data-updater:latest", "order": 1, "extra_args": "-e DATA_SOURCE=treasury_system"},
+            {"name": "analyze", "image": "alm/liq-analyze:latest", "order": 2, "extra_args": "-e PROJECTION_DAYS=90"},
+            {"name": "backtest", "image": "alm/liq-backtest:latest", "order": 3, "extra_args": "-e STRESS_TYPE=idiosyncratic"},
         ],
         "default_config": {
             "lcr_threshold": {"value": 1.0, "type": "float", "description": "Minimum LCR threshold"},
@@ -103,7 +105,7 @@ async def list_models(
     db: AsyncSession = Depends(get_db),
 ):
     """List all models. Available to all authenticated users."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         return list(_DEV_MODELS.values())
     result = await db.execute(select(Model).order_by(Model.name))
     return result.scalars().all()
@@ -116,7 +118,7 @@ async def get_model(
     db: AsyncSession = Depends(get_db),
 ):
     """Get a single model by ID. Available to all authenticated users."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         model_data = _DEV_MODELS.get(str(model_id))
         if model_data:
             return model_data
@@ -136,7 +138,31 @@ async def create_model(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new model. Admin only, develop mode only."""
-    # Check slug uniqueness
+    # Dev mode: write to in-memory store
+    if settings.is_develop:
+        for m in _DEV_MODELS.values():
+            if m["slug"] == body.slug:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Model with slug '{body.slug}' already exists",
+                )
+        model_id = str(uuid_mod.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        model_data = {
+            "id": model_id,
+            "name": body.name,
+            "slug": body.slug,
+            "description": body.description,
+            "docker_images": [img.model_dump() for img in body.docker_images],
+            "default_config": {k: v.model_dump() for k, v in body.default_config.items()},
+            "input_schema": [inp.model_dump() for inp in body.input_schema],
+            "created_at": now,
+            "updated_at": now,
+        }
+        _DEV_MODELS[model_id] = model_data
+        return model_data
+
+    # Production: write to DB
     existing = await db.execute(select(Model).where(Model.slug == body.slug))
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -157,6 +183,148 @@ async def create_model(
     return model
 
 
+@router.get("/{model_id}/export")
+async def export_model(
+    model_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Export a model's full settings as JSON. Available to all authenticated users."""
+    if settings.is_develop:
+        model_data = _DEV_MODELS.get(str(model_id))
+        if not model_data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+        export = {
+            "name": model_data["name"],
+            "slug": model_data["slug"],
+            "description": model_data.get("description"),
+            "input_schema": model_data.get("input_schema", []),
+            "default_config": model_data.get("default_config", {}),
+            "docker_images": model_data.get("docker_images", []),
+        }
+        from backend.api.audit import log_action
+        await log_action(
+            username=getattr(current_user, 'ldap_username', 'admin'),
+            user_id=str(getattr(current_user, 'id', '')),
+            action="export_model", resource_type="model", resource_id=str(model_id),
+            details={"model_name": model_data["name"]},
+            db=None,
+        )
+        return export
+
+    result = await db.execute(select(Model).where(Model.id == model_id))
+    model = result.scalar_one_or_none()
+    if not model:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username,
+        user_id=str(current_user.id),
+        action="export_model", resource_type="model", resource_id=str(model_id),
+        details={"model_name": model.name},
+        db=db,
+    )
+
+    return {
+        "name": model.name,
+        "slug": model.slug,
+        "description": model.description,
+        "input_schema": model.input_schema,
+        "default_config": model.default_config,
+        "docker_images": model.docker_images,
+    }
+
+
+@router.post("/import", response_model=ModelResponse)
+async def import_model(
+    body: ModelCreate,
+    current_user: User = Depends(require_role(["admin"])),
+    db: AsyncSession = Depends(get_db),
+):
+    """Import a model from JSON. Creates or updates by slug. Admin only."""
+    # Dev mode: create or update in-memory
+    if settings.is_develop:
+        existing_id = None
+        for mid, m in _DEV_MODELS.items():
+            if m["slug"] == body.slug:
+                existing_id = mid
+                break
+
+        now = datetime.now(timezone.utc).isoformat()
+        if existing_id:
+            _DEV_MODELS[existing_id].update({
+                "name": body.name,
+                "slug": body.slug,
+                "description": body.description,
+                "docker_images": [img.model_dump() for img in body.docker_images],
+                "default_config": {k: v.model_dump() for k, v in body.default_config.items()},
+                "input_schema": [inp.model_dump() for inp in body.input_schema],
+                "updated_at": now,
+            })
+            return _DEV_MODELS[existing_id]
+        else:
+            model_id = str(uuid_mod.uuid4())
+            model_data = {
+                "id": model_id,
+                "name": body.name,
+                "slug": body.slug,
+                "description": body.description,
+                "docker_images": [img.model_dump() for img in body.docker_images],
+                "default_config": {k: v.model_dump() for k, v in body.default_config.items()},
+                "input_schema": [inp.model_dump() for inp in body.input_schema],
+                "created_at": now,
+                "updated_at": now,
+            }
+            _DEV_MODELS[model_id] = model_data
+            return model_data
+
+    # Production: upsert by slug
+    result = await db.execute(select(Model).where(Model.slug == body.slug))
+    existing_model = result.scalar_one_or_none()
+
+    if existing_model:
+        existing_model.name = body.name
+        existing_model.description = body.description
+        existing_model.docker_images = [img.model_dump() for img in body.docker_images]
+        existing_model.default_config = {k: v.model_dump() for k, v in body.default_config.items()}
+        existing_model.input_schema = [inp.model_dump() for inp in body.input_schema]
+        await db.flush()
+
+        from backend.api.audit import log_action
+        await log_action(
+            username=current_user.ldap_username,
+            user_id=str(current_user.id),
+            action="import_model", resource_type="model", resource_id=str(existing_model.id),
+            details={"model_name": body.name, "action": "updated"},
+            db=db,
+        )
+
+        return existing_model
+    else:
+        model = Model(
+            name=body.name,
+            slug=body.slug,
+            description=body.description,
+            docker_images=[img.model_dump() for img in body.docker_images],
+            default_config={k: v.model_dump() for k, v in body.default_config.items()},
+            input_schema=[inp.model_dump() for inp in body.input_schema],
+        )
+        db.add(model)
+        await db.flush()
+
+        from backend.api.audit import log_action
+        await log_action(
+            username=current_user.ldap_username,
+            user_id=str(current_user.id),
+            action="import_model", resource_type="model", resource_id=str(model.id),
+            details={"model_name": body.name, "action": "created"},
+            db=db,
+        )
+
+        return model
+
+
 @router.put("/{model_id}/config", response_model=ModelResponse)
 async def update_config(
     model_id: UUID,
@@ -166,7 +334,7 @@ async def update_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Update model default config. Admin only, develop mode only."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         model_data = _DEV_MODELS.get(str(model_id))
         if not model_data:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
@@ -193,7 +361,7 @@ async def update_input_schema(
     db: AsyncSession = Depends(get_db),
 ):
     """Update model input schema. Admin only, develop mode only."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         model_data = _DEV_MODELS.get(str(model_id))
         if not model_data:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
@@ -220,7 +388,7 @@ async def update_containers(
     db: AsyncSession = Depends(get_db),
 ):
     """Update model container images and order. Admin only, develop mode only."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         model_data = _DEV_MODELS.get(str(model_id))
         if not model_data:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
@@ -236,3 +404,47 @@ async def update_containers(
     model.docker_images = [img.model_dump() for img in body.docker_images]
     await db.flush()
     return model
+
+
+@router.delete("/{model_id}")
+async def delete_model(
+    model_id: UUID,
+    current_user: User = Depends(require_role(["admin"])),
+    _: None = Depends(require_develop_mode()),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a model. Admin only, develop mode only."""
+    if settings.is_develop:
+        model_data = _DEV_MODELS.pop(str(model_id), None)
+        if not model_data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+
+        from backend.api.audit import log_action
+        await log_action(
+            username=getattr(current_user, 'ldap_username', 'admin'),
+            user_id=str(getattr(current_user, 'id', '')),
+            action="delete_model", resource_type="model", resource_id=str(model_id),
+            details={"model_name": model_data["name"]},
+            db=None,
+        )
+        return {"detail": f"Model '{model_data['name']}' deleted"}
+
+    result = await db.execute(select(Model).where(Model.id == model_id))
+    model = result.scalar_one_or_none()
+    if not model:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+
+    model_name = model.name
+    await db.delete(model)
+    await db.flush()
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username,
+        user_id=str(current_user.id),
+        action="delete_model", resource_type="model", resource_id=str(model_id),
+        details={"model_name": model_name},
+        db=db,
+    )
+
+    return {"detail": f"Model '{model_name}' deleted"}

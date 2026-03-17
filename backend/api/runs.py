@@ -319,10 +319,11 @@ async def create_run(
             _DEV_LOGS[run_id].append(f"[system] Waiting in queue — {len(_ACTIVE_RUN_IDS)} runs already executing (max {MAX_CONCURRENT_RUNS})")
 
         from backend.api.audit import log_action
-        log_action(
+        await log_action(
             username="admin", user_id=str(current_user.id),
             action="create_run", resource_type="run", resource_id=run_id,
             details={"model_id": model_id, "model_name": _get_model_name(model_id)},
+            db=None,
         )
 
         return run
@@ -341,13 +342,14 @@ async def create_run(
         from backend.api.audit import log_action
         model_result = await db.execute(select(Model).where(Model.id == body.model_id))
         model_obj = model_result.scalar_one_or_none()
-        log_action(
+        await log_action(
             username=current_user.ldap_username,
             user_id=str(current_user.id),
             action="create_run",
             resource_type="run",
             resource_id=str(run.id),
             details={"model_id": str(body.model_id), "model_name": model_obj.name if model_obj else "Unknown"},
+            db=db,
         )
 
         return run
@@ -582,22 +584,30 @@ async def archive_run(
     db: AsyncSession = Depends(get_db),
 ):
     """Archive a completed run."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         run = _DEV_RUNS.get(str(run_id))
-        if not run:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-        if run["is_archived"]:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already archived")
-        if run["status"] not in ("completed", "failed", "cancelled"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Run must be completed/failed/cancelled")
+        if run:
+            if run["is_archived"]:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already archived")
+            if run["status"] not in ("completed", "failed", "cancelled"):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Run must be completed/failed/cancelled")
 
-        archive_path = f"/tmp/alm-archives/{current_user.ldap_username}/{str(run_id)}"
-        os.makedirs(archive_path, exist_ok=True)
+            archive_path = f"/tmp/alm-archives/{current_user.ldap_username}/{str(run_id)}"
+            os.makedirs(archive_path, exist_ok=True)
 
-        run["is_archived"] = True
-        run["archived_at"] = datetime.now(timezone.utc).isoformat()
-        run["archive_path"] = archive_path
-        return run
+            run["is_archived"] = True
+            run["archived_at"] = datetime.now(timezone.utc).isoformat()
+            run["archive_path"] = archive_path
+
+            from backend.api.audit import log_action
+            await log_action(
+                username=current_user.ldap_username, user_id=str(current_user.id),
+                action="archive_run", resource_type="run", resource_id=str(run_id),
+                details={"model_name": run.get("model_name", "")},
+                db=db,
+            )
+            return run
+        # Fall through to DB path if not in memory
 
     try:
         from backend.services import archive_service
@@ -614,17 +624,25 @@ async def unarchive_run(
     db: AsyncSession = Depends(get_db),
 ):
     """Unarchive a run."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         run = _DEV_RUNS.get(str(run_id))
-        if not run:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-        if not run["is_archived"]:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not archived")
+        if run:
+            if not run["is_archived"]:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not archived")
 
-        run["is_archived"] = False
-        run["archived_at"] = None
-        run["archive_path"] = None
-        return run
+            run["is_archived"] = False
+            run["archived_at"] = None
+            run["archive_path"] = None
+
+            from backend.api.audit import log_action
+            await log_action(
+                username=current_user.ldap_username, user_id=str(current_user.id),
+                action="unarchive_run", resource_type="run", resource_id=str(run_id),
+                details={"model_name": run.get("model_name", "")},
+                db=db,
+            )
+            return run
+        # Fall through to DB path if not in memory
 
     # Production: update DB
     result = await db.execute(select(Run).where(Run.id == run_id))
@@ -647,20 +665,38 @@ async def delete_run(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a run permanently."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         run = _DEV_RUNS.get(str(run_id))
-        if not run:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-        del _DEV_RUNS[str(run_id)]
-        _DEV_LOGS.pop(str(run_id), None)
-        return {"detail": f"Run {run_id} deleted"}
+        if run:
+            run_name = run.get("model_name", "")
+            del _DEV_RUNS[str(run_id)]
+            _DEV_LOGS.pop(str(run_id), None)
+
+            from backend.api.audit import log_action
+            await log_action(
+                username=current_user.ldap_username, user_id=str(current_user.id),
+                action="delete_run", resource_type="run", resource_id=str(run_id),
+                details={"model_name": run_name},
+                db=db,
+            )
+            return {"detail": f"Run {run_id} deleted"}
+        # Fall through to DB path if not in memory
 
     result = await db.execute(select(Run).where(Run.id == run_id))
     run = result.scalar_one_or_none()
     if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    run_model_id = str(run.model_id) if run.model_id else ""
     await db.delete(run)
     await db.flush()
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username, user_id=str(current_user.id),
+        action="delete_run", resource_type="run", resource_id=str(run_id),
+        details={"model_id": run_model_id},
+        db=db,
+    )
     return {"detail": f"Run {run_id} deleted"}
 
 

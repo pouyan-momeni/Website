@@ -48,7 +48,7 @@ async def login(
         )
 
         from backend.api.audit import log_action
-        log_action(body.username, dev_user["id"], "login", "auth", details={"role": dev_user["role"]})
+        await log_action(body.username, dev_user["id"], "login", "auth", details={"role": dev_user["role"]}, db=db)
 
         return TokenResponse(access_token=access_token)
 
@@ -96,6 +96,16 @@ async def login(
         samesite="lax",
         max_age=settings.REFRESH_TOKEN_EXPIRE_MINUTES * 60,
         path="/api/auth",
+    )
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=user.ldap_username,
+        user_id=str(user.id),
+        action="login",
+        resource_type="auth",
+        details={"role": user.role},
+        db=db,
     )
 
     return TokenResponse(access_token=access_token)

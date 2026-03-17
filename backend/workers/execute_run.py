@@ -201,22 +201,34 @@ def execute_model_run(self, run_id: str) -> dict:
             run.current_container_index = idx
             db.commit()
 
-            # ── Prepare env vars ──
-            env = dict(img_spec.get("env", {}))
-            # Add run-specific env vars
-            env["RUN_ID"] = run_id
-            env["MODEL_SLUG"] = model.slug
-            env["OUTPUT_DIR"] = "/data/output"
-            env["LOG_DIR"] = "/data/logs"
+            # ── Prepare extra_args ──
+            # Start with the model-configured extra_args
+            extra_args_parts = []
+            model_extra_args = img_spec.get("extra_args", "")
+            if model_extra_args:
+                extra_args_parts.append(model_extra_args.strip())
+
+            # Add run-specific env vars as -e flags
+            run_env = {
+                "RUN_ID": run_id,
+                "MODEL_SLUG": model.slug,
+                "OUTPUT_DIR": "/data/output",
+                "LOG_DIR": "/data/logs",
+            }
             # Add config snapshot as env vars
             if run.config_snapshot:
                 for key, val in run.config_snapshot.items():
                     config_val = val.get("value", val) if isinstance(val, dict) else val
-                    env[f"CONFIG_{key.upper()}"] = str(config_val)
+                    run_env[f"CONFIG_{key.upper()}"] = str(config_val)
             # Add inputs as env vars
             if run.inputs:
                 for key, val in run.inputs.items():
-                    env[f"INPUT_{key.upper()}"] = str(val)
+                    run_env[f"INPUT_{key.upper()}"] = str(val)
+
+            for k, v in run_env.items():
+                extra_args_parts.append(f"-e {k}={v}")
+
+            extra_args = "\n".join(extra_args_parts)
 
             # ── Run container with retries ──
             success = False
@@ -232,7 +244,7 @@ def execute_model_run(self, run_id: str) -> dict:
                     result = docker_runner.run_container(
                         image=image,
                         volumes=volumes,
-                        env=env,
+                        extra_args=extra_args,
                         run_id=run_id,
                         container_name=container_name,
                     )

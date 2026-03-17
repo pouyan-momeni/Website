@@ -1,4 +1,4 @@
-"""Monitoring API routes: resources and containers."""
+"""Monitoring API routes: resources, containers, and notebooks."""
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -6,7 +6,7 @@ from backend.auth.dependencies import require_role
 from backend.config import settings
 from backend.docker_runner.runner import DockerRunner
 from backend.models.user import User
-from backend.schemas.schemas import ResourceSnapshot, ContainerInfo
+from backend.schemas.schemas import ResourceSnapshot, ContainerInfo, NotebookMonitorInfo
 from backend.services import resource_service
 
 router = APIRouter(prefix="/api/monitoring", tags=["monitoring"])
@@ -54,6 +54,7 @@ async def get_containers(
                     run_id=str(run.id),
                     started_at=run.started_at.isoformat() if run.started_at else None,
                     memory_usage_mb=round(128 + hash(str(run.id)) % 256, 2),
+                    cpu_percent=round((hash(str(run.id)) % 50) + 5, 1),
                 ))
             return containers
         finally:
@@ -70,17 +71,64 @@ async def get_containers(
             run_id=c.run_id,
             started_at=c.started_at,
             memory_usage_mb=c.memory_usage_mb,
+            cpu_percent=c.cpu_percent,
         )
         for c in containers
     ]
 
 
+@router.get("/notebooks", response_model=list[NotebookMonitorInfo])
+async def get_notebooks(
+    current_user: User = Depends(require_role(["admin", "developer", "runner"])),
+):
+    """List running notebooks with resource stats. Runner+ role required."""
+    from backend.api.notebooks import _NOTEBOOKS
+
+    running = [nb for nb in _NOTEBOOKS.values() if nb.get("status") == "running"]
+    results = []
+    for nb in running:
+        cpu_percent = None
+        memory_mb = None
+
+        # In production, try to get real stats if docker_id is available
+        if not settings.is_develop and nb.get("docker_id"):
+            try:
+                runner = DockerRunner()
+                stats = runner.get_container_stats(nb["docker_id"])
+                cpu_percent = stats.get("cpu_percent")
+                memory_mb = stats.get("memory_mb")
+            except Exception:
+                pass
+
+        # Dev mode: simulate stats with random fluctuation
+        if settings.is_develop:
+            import random
+            base_cpu = (hash(nb["id"]) % 20) + 5
+            base_mem = 80 + (hash(nb["id"]) % 100)
+            cpu_percent = round(base_cpu + random.uniform(-3, 5), 1)
+            memory_mb = round(base_mem + random.uniform(-10, 15), 1)
+
+        results.append(NotebookMonitorInfo(
+            id=nb["id"],
+            name=nb["name"],
+            owner_username=nb.get("owner_username", "unknown"),
+            status=nb["status"],
+            url=nb.get("url"),
+            port=nb.get("port"),
+            cpu_percent=cpu_percent,
+            memory_mb=memory_mb,
+            started_at=nb.get("updated_at"),
+        ))
+
+    return results
+
+
 @router.delete("/containers/{docker_id}")
 async def kill_container(
     docker_id: str,
-    current_user: User = Depends(require_role(["admin", "developer", "runner"])),
+    current_user: User = Depends(require_role(["admin"])),
 ):
-    """Kill a running Docker container immediately. Runner+ role required."""
+    """Kill a running Docker container immediately. Admin only."""
     runner = DockerRunner()
     try:
         runner.kill_container(docker_id)
@@ -90,3 +138,61 @@ async def kill_container(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to kill container: {exc}",
         )
+
+
+@router.post("/containers/{docker_id}/pause")
+async def pause_container(
+    docker_id: str,
+    current_user: User = Depends(require_role(["admin"])),
+):
+    """Pause a running container. Admin only."""
+    runner = DockerRunner()
+    try:
+        runner.pause_container(docker_id)
+        return {"detail": f"Container {docker_id} paused"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to pause container: {exc}",
+        )
+
+
+@router.post("/containers/{docker_id}/resume")
+async def resume_container(
+    docker_id: str,
+    current_user: User = Depends(require_role(["admin"])),
+):
+    """Resume a paused container. Admin only."""
+    runner = DockerRunner()
+    try:
+        runner.resume_container(docker_id)
+        return {"detail": f"Container {docker_id} resumed"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to resume container: {exc}",
+        )
+
+
+@router.post("/notebooks/{notebook_id}/stop")
+async def stop_notebook_from_monitoring(
+    notebook_id: str,
+    current_user: User = Depends(require_role(["admin"])),
+):
+    """Stop a running notebook. Admin only."""
+    from backend.api.notebooks import _NOTEBOOKS
+
+    nb = _NOTEBOOKS.get(notebook_id)
+    if not nb:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notebook not found")
+    if nb["status"] == "stopped":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already stopped")
+
+    nb["status"] = "stopped"
+    nb["port"] = None
+    nb["url"] = None
+
+    from datetime import datetime, timezone
+    nb["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    return {"detail": f"Notebook '{nb['name']}' stopped"}

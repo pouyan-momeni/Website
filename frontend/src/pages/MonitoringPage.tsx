@@ -1,9 +1,10 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { api } from '../api/client';
-import { Loader2, Cpu, HardDrive, MemoryStick, Skull } from 'lucide-react';
+import { Loader2, Cpu, HardDrive, MemoryStick, Skull, Pause, Play, Square } from 'lucide-react';
 import { useState, useEffect } from 'react';
-import type { ResourceSnapshot } from '../types';
+import { useAuthStore } from '../stores/auth';
+import type { ResourceSnapshot, NotebookMonitorInfo } from '../types';
 
 function GaugeCard({ label, value, total, unit, color, icon: Icon }: {
     label: string; value: number; total: number; unit: string; color: string;
@@ -31,18 +32,25 @@ function GaugeCard({ label, value, total, unit, color, icon: Icon }: {
 
 export default function MonitoringPage() {
     const queryClient = useQueryClient();
+    const isAdmin = useAuthStore(s => s.hasRole(['admin']));
     const [history, setHistory] = useState<{ time: string; cpu: number; memory: number; disk: number }[]>([]);
 
     const { data: resources } = useQuery({
         queryKey: ['resources'],
         queryFn: () => api.getResources(),
-        refetchInterval: 30000,
+        refetchInterval: 10000,
     });
 
     const { data: containers, isLoading: containersLoading } = useQuery({
         queryKey: ['containers'],
         queryFn: () => api.getContainers(),
-        refetchInterval: 30000,
+        refetchInterval: 10000,
+    });
+
+    const { data: notebooks, isLoading: notebooksLoading } = useQuery<NotebookMonitorInfo[]>({
+        queryKey: ['monitoring-notebooks'],
+        queryFn: () => api.getMonitoringNotebooks(),
+        refetchInterval: 10000,
     });
 
     const killMutation = useMutation({
@@ -50,7 +58,22 @@ export default function MonitoringPage() {
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ['containers'] }),
     });
 
-    // Track resource history for charts
+    const pauseMutation = useMutation({
+        mutationFn: (dockerId: string) => api.pauseContainer(dockerId),
+        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['containers'] }),
+    });
+
+    const resumeMutation = useMutation({
+        mutationFn: (dockerId: string) => api.resumeContainer(dockerId),
+        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['containers'] }),
+    });
+
+    const stopNotebookMutation = useMutation({
+        mutationFn: (notebookId: string) => api.stopMonitoringNotebook(notebookId),
+        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['monitoring-notebooks'] }),
+    });
+
+    // Track resource history for charts — seed immediately on first load
     useEffect(() => {
         if (resources) {
             setHistory(prev => {
@@ -60,7 +83,11 @@ export default function MonitoringPage() {
                     memory: resources.memory_percent,
                     disk: resources.disk_percent,
                 };
-                const updated = [...prev, newPoint].slice(-20);
+                // If empty, seed with 2 identical points so the chart renders a line
+                if (prev.length === 0) {
+                    return [newPoint, { ...newPoint, time: new Date().toLocaleTimeString() }];
+                }
+                const updated = [...prev, newPoint].slice(-60);
                 return updated;
             });
         }
@@ -103,7 +130,7 @@ export default function MonitoringPage() {
             {/* Chart */}
             {history.length > 1 && (
                 <div className="bg-card border border-border rounded-xl p-5 mb-8">
-                    <h2 className="text-sm font-medium text-muted-foreground mb-4">Resource History (last 10 minutes)</h2>
+                    <h2 className="text-sm font-medium text-muted-foreground mb-4">Resource History (polling every 10s)</h2>
                     <ResponsiveContainer width="100%" height={200}>
                         <AreaChart data={history}>
                             <CartesianGrid strokeDasharray="3 3" stroke="hsl(217 33% 18%)" />
@@ -120,6 +147,61 @@ export default function MonitoringPage() {
                     </ResponsiveContainer>
                 </div>
             )}
+
+            {/* Running Notebooks */}
+            <div className="bg-card border border-border rounded-xl overflow-hidden mb-8">
+                <div className="p-4 border-b border-border">
+                    <h2 className="text-lg font-semibold">Running Notebooks</h2>
+                </div>
+                {notebooksLoading ? (
+                    <div className="flex justify-center py-8"><Loader2 className="w-6 h-6 animate-spin text-primary" /></div>
+                ) : !notebooks || notebooks.length === 0 ? (
+                    <div className="p-8 text-center text-muted-foreground text-sm">No notebooks currently running.</div>
+                ) : (
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                            <thead>
+                                <tr className="border-b border-border text-muted-foreground text-left">
+                                    <th className="px-4 py-3 font-medium">Name</th>
+                                    <th className="px-4 py-3 font-medium">Owner</th>
+                                    <th className="px-4 py-3 font-medium">Status</th>
+                                    <th className="px-4 py-3 font-medium">CPU %</th>
+                                    <th className="px-4 py-3 font-medium">Memory</th>
+                                    <th className="px-4 py-3 font-medium">Started</th>
+                                    {isAdmin && <th className="px-4 py-3 font-medium">Actions</th>}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {notebooks.map(nb => (
+                                    <tr key={nb.id} className="border-b border-border/50 hover:bg-accent/30 transition-colors">
+                                        <td className="px-4 py-3 font-medium">{nb.name}</td>
+                                        <td className="px-4 py-3 text-muted-foreground">{nb.owner_username}</td>
+                                        <td className="px-4 py-3">
+                                            <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${nb.status === 'running' ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'}`}>
+                                                {nb.status}
+                                            </span>
+                                        </td>
+                                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{nb.cpu_percent != null ? `${nb.cpu_percent}%` : '—'}</td>
+                                        <td className="px-4 py-3 text-muted-foreground">{nb.memory_mb != null ? `${nb.memory_mb} MB` : '—'}</td>
+                                        <td className="px-4 py-3 text-muted-foreground text-xs">{nb.started_at ? new Date(nb.started_at).toLocaleString() : '—'}</td>
+                                        {isAdmin && (
+                                            <td className="px-4 py-3">
+                                                <button
+                                                    onClick={() => stopNotebookMutation.mutate(nb.id)}
+                                                    className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                                                    title="Stop notebook"
+                                                >
+                                                    <Square className="w-4 h-4" />
+                                                </button>
+                                            </td>
+                                        )}
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                )}
+            </div>
 
             {/* Running containers */}
             <div className="bg-card border border-border rounded-xl overflow-hidden">
@@ -138,9 +220,10 @@ export default function MonitoringPage() {
                                     <th className="px-4 py-3 font-medium">Name</th>
                                     <th className="px-4 py-3 font-medium">Image</th>
                                     <th className="px-4 py-3 font-medium">Run ID</th>
-                                    <th className="px-4 py-3 font-medium">Started</th>
+                                    <th className="px-4 py-3 font-medium">CPU %</th>
                                     <th className="px-4 py-3 font-medium">Memory</th>
-                                    <th className="px-4 py-3 font-medium">Actions</th>
+                                    <th className="px-4 py-3 font-medium">Started</th>
+                                    {isAdmin && <th className="px-4 py-3 font-medium">Actions</th>}
                                 </tr>
                             </thead>
                             <tbody>
@@ -149,17 +232,36 @@ export default function MonitoringPage() {
                                         <td className="px-4 py-3 font-medium">{container.name}</td>
                                         <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{container.image}</td>
                                         <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{container.run_id?.slice(0, 8) || '—'}</td>
-                                        <td className="px-4 py-3 text-muted-foreground">{container.started_at ? new Date(container.started_at).toLocaleString() : '—'}</td>
+                                        <td className="px-4 py-3 text-muted-foreground font-mono text-xs">{container.cpu_percent != null ? `${container.cpu_percent}%` : '—'}</td>
                                         <td className="px-4 py-3 text-muted-foreground">{container.memory_usage_mb ? `${container.memory_usage_mb} MB` : '—'}</td>
-                                        <td className="px-4 py-3">
-                                            <button
-                                                onClick={() => killMutation.mutate(container.docker_id)}
-                                                className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                                                title="Kill container"
-                                            >
-                                                <Skull className="w-4 h-4" />
-                                            </button>
-                                        </td>
+                                        <td className="px-4 py-3 text-muted-foreground">{container.started_at ? new Date(container.started_at).toLocaleString() : '—'}</td>
+                                        {isAdmin && (
+                                            <td className="px-4 py-3">
+                                                <div className="flex items-center gap-1">
+                                                    <button
+                                                        onClick={() => pauseMutation.mutate(container.docker_id)}
+                                                        className="p-1.5 rounded-md text-muted-foreground hover:text-amber-400 hover:bg-amber-500/10 transition-colors"
+                                                        title="Pause container"
+                                                    >
+                                                        <Pause className="w-4 h-4" />
+                                                    </button>
+                                                    <button
+                                                        onClick={() => resumeMutation.mutate(container.docker_id)}
+                                                        className="p-1.5 rounded-md text-muted-foreground hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors"
+                                                        title="Resume container"
+                                                    >
+                                                        <Play className="w-4 h-4" />
+                                                    </button>
+                                                    <button
+                                                        onClick={() => killMutation.mutate(container.docker_id)}
+                                                        className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                                                        title="Kill container"
+                                                    >
+                                                        <Skull className="w-4 h-4" />
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        )}
                                     </tr>
                                 ))}
                             </tbody>

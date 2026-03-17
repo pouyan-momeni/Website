@@ -48,6 +48,25 @@ async def create_user(
     )
     db.add(user)
     await db.flush()
+
+    # Create personal notebook folder for the new user
+    import os
+    from backend.config import settings as app_settings
+    user_folder = os.path.join(app_settings.MARIMO_BASE_PATH, body.ldap_username)
+    os.makedirs(user_folder, exist_ok=True)
+
+    # Audit log the creation
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username,
+        user_id=str(current_user.id),
+        action="create_user",
+        resource_type="user",
+        resource_id=str(user.id),
+        details={"created_username": body.ldap_username, "role": body.role, "notebook_folder": user_folder},
+        db=db,
+    )
+
     return user
 
 
@@ -70,12 +89,12 @@ async def update_user_role(
 
 
 @router.delete("/{user_id}")
-async def deactivate_user(
+async def delete_user(
     user_id: UUID,
     current_user: User = Depends(require_role(["admin"])),
     db: AsyncSession = Depends(get_db),
 ):
-    """Soft-delete a user (set is_active=false). Admin only."""
+    """Permanently delete a user. Admin only."""
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -84,9 +103,23 @@ async def deactivate_user(
     if user.id == current_user.id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot deactivate yourself",
+            detail="Cannot delete yourself",
         )
 
-    user.is_active = False
+    deleted_username = user.ldap_username
+    await db.delete(user)
     await db.flush()
-    return {"detail": f"User '{user.ldap_username}' deactivated"}
+
+    # Audit log the deletion
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username,
+        user_id=str(current_user.id),
+        action="delete_user",
+        resource_type="user",
+        resource_id=str(user_id),
+        details={"deleted_username": deleted_username},
+        db=db,
+    )
+
+    return {"detail": f"User '{deleted_username}' deleted"}

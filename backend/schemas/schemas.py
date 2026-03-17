@@ -52,7 +52,7 @@ class DockerImageSpec(BaseModel):
     name: str
     image: str
     order: int
-    env: dict[str, str] = Field(default_factory=dict)
+    extra_args: str = Field(default="", description="Raw docker run arguments, e.g. --rm -v /host:/container -e KEY=val")
 
 
 class ConfigField(BaseModel):
@@ -222,6 +222,19 @@ class ContainerInfo(BaseModel):
     run_id: Optional[str]
     started_at: Optional[str]
     memory_usage_mb: Optional[float]
+    cpu_percent: Optional[float] = None
+
+
+class NotebookMonitorInfo(BaseModel):
+    id: str
+    name: str
+    owner_username: str
+    status: str
+    url: Optional[str]
+    port: Optional[int]
+    cpu_percent: Optional[float] = None
+    memory_mb: Optional[float] = None
+    started_at: Optional[str] = None
 
 
 # ─── Marimo ──────────────────────────────────────────────────────────────────

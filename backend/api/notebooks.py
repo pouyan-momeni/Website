@@ -13,13 +13,15 @@ from pydantic import BaseModel
 
 from backend.auth.dependencies import get_current_user
 from backend.config import settings
+from backend.database import get_db
+from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/api/notebooks", tags=["notebooks"])
 
 # ─── In-memory notebook store (dev mode) ───
 _NOTEBOOKS: dict[str, dict] = {}
 
-# Pre-populate with template notebooks for EACH dev user
+# Pre-populate with template notebooks for EACH dev user + shared notebooks
 if settings.is_develop:
     from backend.config import DEV_USERS
     _template_notebooks = [
@@ -38,12 +40,36 @@ if settings.is_develop:
                 "description": nb_data["desc"],
                 "owner_id": user_info["id"],
                 "owner_username": username,
+                "folder": "personal",
                 "status": "stopped",
                 "created_at": datetime(2026, 2, 20 + i, 10, 0, 0, tzinfo=timezone.utc).isoformat(),
                 "updated_at": datetime(2026, 2, 22 + min(i, 2), 14, 30, 0, tzinfo=timezone.utc).isoformat(),
                 "port": None,
                 "url": None,
             }
+
+    # Shared library notebooks (read-only templates, owned by "system")
+    _shared_templates = [
+        {"name": "Getting Started Guide", "desc": "Introduction to the Marimo notebook environment and ALM data access patterns."},
+        {"name": "VaR Calculation Template", "desc": "Standardized Value-at-Risk calculation using historical simulation."},
+        {"name": "Duration Gap Analysis", "desc": "Compute and visualize duration gap across asset and liability portfolios."},
+        {"name": "Interest Rate Sensitivity", "desc": "Multi-scenario interest rate sensitivity analysis with NII impact."},
+    ]
+    for i, nb_data in enumerate(_shared_templates):
+        nb_id = str(uuid.uuid4())
+        _NOTEBOOKS[nb_id] = {
+            "id": nb_id,
+            "name": nb_data["name"],
+            "description": nb_data["desc"],
+            "owner_id": "system",
+            "owner_username": "shared",
+            "folder": "shared",
+            "status": "stopped",
+            "created_at": datetime(2026, 1, 15 + i, 10, 0, 0, tzinfo=timezone.utc).isoformat(),
+            "updated_at": datetime(2026, 2, 10 + i, 14, 0, 0, tzinfo=timezone.utc).isoformat(),
+            "port": None,
+            "url": None,
+        }
 
 
 class NotebookCreate(BaseModel):
@@ -57,6 +83,8 @@ class NotebookResponse(BaseModel):
     description: Optional[str] = None
     owner_id: str
     owner_username: str
+    folder: str = "personal"  # "personal" or "shared"
+    shared_from: Optional[str] = None  # ID of the personal notebook this was shared from
     status: str  # "stopped" | "running" | "paused"
     created_at: str
     updated_at: Optional[str] = None
@@ -66,9 +94,17 @@ class NotebookResponse(BaseModel):
 
 @router.get("", response_model=list[NotebookResponse])
 async def list_notebooks(current_user=Depends(get_current_user)):
-    """List notebooks owned by the current user."""
+    """List personal notebooks owned by the current user."""
     user_id = str(current_user.id)
-    notebooks = [nb for nb in _NOTEBOOKS.values() if nb["owner_id"] == user_id]
+    notebooks = [nb for nb in _NOTEBOOKS.values() if nb["owner_id"] == user_id and nb.get("folder") == "personal"]
+    notebooks.sort(key=lambda nb: nb.get("updated_at", nb["created_at"]), reverse=True)
+    return notebooks
+
+
+@router.get("/shared", response_model=list[NotebookResponse])
+async def list_shared_notebooks(current_user=Depends(get_current_user)):
+    """List shared library notebooks (read-only). Available to all authenticated users."""
+    notebooks = [nb for nb in _NOTEBOOKS.values() if nb.get("folder") == "shared"]
     notebooks.sort(key=lambda nb: nb.get("updated_at", nb["created_at"]), reverse=True)
     return notebooks
 
@@ -84,6 +120,7 @@ async def create_notebook(body: NotebookCreate, current_user=Depends(get_current
         "description": body.description or "",
         "owner_id": str(current_user.id),
         "owner_username": current_user.ldap_username,
+        "folder": "personal",
         "status": "stopped",
         "created_at": now,
         "updated_at": now,
@@ -92,6 +129,86 @@ async def create_notebook(body: NotebookCreate, current_user=Depends(get_current
     }
     _NOTEBOOKS[nb_id] = notebook
     return notebook
+
+
+@router.post("/{notebook_id}/copy", response_model=NotebookResponse, status_code=status.HTTP_201_CREATED)
+async def copy_shared_notebook(notebook_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Copy a shared notebook into the current user's personal folder."""
+    source = _NOTEBOOKS.get(notebook_id)
+    if not source:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notebook not found")
+    if source.get("folder") != "shared":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Can only copy shared notebooks")
+
+    nb_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    copy = {
+        "id": nb_id,
+        "name": f"{source['name']} (copy)",
+        "description": source.get("description", ""),
+        "owner_id": str(current_user.id),
+        "owner_username": current_user.ldap_username,
+        "folder": "personal",
+        "status": "stopped",
+        "created_at": now,
+        "updated_at": now,
+        "port": None,
+        "url": None,
+    }
+    _NOTEBOOKS[nb_id] = copy
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username, user_id=str(current_user.id),
+        action="copy_shared_notebook", resource_type="notebook", resource_id=nb_id,
+        details={"source_id": notebook_id, "source_name": source["name"]},
+        db=db,
+    )
+    return copy
+
+
+@router.post("/{notebook_id}/share", response_model=NotebookResponse, status_code=status.HTTP_201_CREATED)
+async def share_notebook(notebook_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Share a personal notebook by copying it to the shared library."""
+    source = _NOTEBOOKS.get(notebook_id)
+    if not source:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notebook not found")
+    if source.get("folder") != "personal":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Notebook is already shared")
+    if source["owner_id"] != str(current_user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your notebook")
+
+    # Prevent duplicate shares — check if a shared copy already exists for this source
+    for nb in _NOTEBOOKS.values():
+        if nb.get("folder") == "shared" and nb.get("shared_from") == notebook_id:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Notebook is already shared")
+
+    nb_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    shared_copy = {
+        "id": nb_id,
+        "name": source["name"],
+        "description": source.get("description", ""),
+        "owner_id": str(current_user.id),
+        "owner_username": current_user.ldap_username,
+        "folder": "shared",
+        "shared_from": notebook_id,
+        "status": "stopped",
+        "created_at": now,
+        "updated_at": now,
+        "port": None,
+        "url": None,
+    }
+    _NOTEBOOKS[nb_id] = shared_copy
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username, user_id=str(current_user.id),
+        action="share_notebook", resource_type="notebook", resource_id=nb_id,
+        details={"source_id": notebook_id, "source_name": source["name"]},
+        db=db,
+    )
+    return shared_copy
 
 
 @router.get("/{notebook_id}", response_model=NotebookResponse)
@@ -119,7 +236,7 @@ async def update_notebook(notebook_id: str, body: NotebookCreate, current_user=D
 
 
 @router.post("/{notebook_id}/start", response_model=NotebookResponse)
-async def start_notebook(notebook_id: str, current_user=Depends(get_current_user)):
+async def start_notebook(notebook_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Start a notebook — launches the Marimo editor."""
     nb = _NOTEBOOKS.get(notebook_id)
     if not nb:
@@ -138,10 +255,11 @@ async def start_notebook(notebook_id: str, current_user=Depends(get_current_user
             nb["updated_at"] = datetime.now(timezone.utc).isoformat()
 
             from backend.api.audit import log_action
-            log_action(
+            await log_action(
                 username=current_user.ldap_username, user_id=str(current_user.id),
                 action="start_notebook", resource_type="notebook", resource_id=notebook_id,
                 details={"name": nb["name"]},
+                db=db,
             )
 
             return nb
@@ -161,13 +279,22 @@ async def start_notebook(notebook_id: str, current_user=Depends(get_current_user
         nb["port"] = port
         nb["url"] = f"/api/notebooks/{notebook_id}/proxy/"
         nb["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        from backend.api.audit import log_action
+        await log_action(
+            username=current_user.ldap_username, user_id=str(current_user.id),
+            action="start_notebook", resource_type="notebook", resource_id=notebook_id,
+            details={"name": nb["name"]},
+            db=db,
+        )
+
         return nb
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
 
 
 @router.post("/{notebook_id}/stop", response_model=NotebookResponse)
-async def stop_notebook(notebook_id: str, current_user=Depends(get_current_user)):
+async def stop_notebook(notebook_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Stop a running notebook."""
     nb = _NOTEBOOKS.get(notebook_id)
     if not nb:
@@ -179,6 +306,15 @@ async def stop_notebook(notebook_id: str, current_user=Depends(get_current_user)
     nb["port"] = None
     nb["url"] = None
     nb["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username, user_id=str(current_user.id),
+        action="stop_notebook", resource_type="notebook", resource_id=notebook_id,
+        details={"name": nb["name"]},
+        db=db,
+    )
+
     return nb
 
 
@@ -196,15 +332,61 @@ async def pause_notebook(notebook_id: str, current_user=Depends(get_current_user
     return nb
 
 
+@router.post("/{notebook_id}/unshare", status_code=status.HTTP_200_OK)
+async def unshare_notebook(notebook_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Remove a notebook from the shared library. Only the original sharer can unshare."""
+    nb = _NOTEBOOKS.get(notebook_id)
+    if not nb:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notebook not found")
+    if nb.get("folder") != "shared":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Notebook is not in the shared library")
+    if nb["owner_id"] != str(current_user.id):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the notebook owner can unshare it")
+
+    nb_name = nb["name"]
+    del _NOTEBOOKS[notebook_id]
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username, user_id=str(current_user.id),
+        action="unshare_notebook", resource_type="notebook", resource_id=notebook_id,
+        details={"name": nb_name},
+        db=db,
+    )
+    return {"detail": f"Notebook '{nb_name}' removed from shared library"}
+
+
 @router.delete("/{notebook_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_notebook(notebook_id: str, current_user=Depends(get_current_user)):
-    """Delete a notebook."""
+async def delete_notebook(notebook_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Delete a notebook. Admins can delete shared notebooks; owners can delete their own."""
     nb = _NOTEBOOKS.get(notebook_id)
     if not nb:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notebook not found")
     if nb["status"] == "running":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Stop the notebook before deleting")
+
+    is_admin = hasattr(current_user, 'role') and current_user.role == 'admin'
+    is_owner = nb["owner_id"] == str(current_user.id)
+    is_shared = nb.get("folder") == "shared"
+
+    # Shared notebooks: only admins can delete
+    if is_shared and not is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can delete shared notebooks")
+    # Personal notebooks: only the owner can delete
+    if not is_shared and not is_owner:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not your notebook")
+
+    nb_name = nb["name"]
+    nb_folder = nb.get("folder", "personal")
     del _NOTEBOOKS[notebook_id]
+
+    from backend.api.audit import log_action
+    await log_action(
+        username=current_user.ldap_username, user_id=str(current_user.id),
+        action="delete_notebook", resource_type="notebook", resource_id=notebook_id,
+        details={"name": nb_name, "folder": nb_folder},
+        db=db,
+    )
 
 
 # ─── Reverse Proxy for Marimo ───────────────────────────────────────────────────

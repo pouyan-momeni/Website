@@ -11,7 +11,7 @@ export interface DockerImageSpec {
     name: string;
     image: string;
     order: number;
-    env: Record<string, string>;
+    extra_args: string;
 }
 
 export interface ConfigField {
@@ -123,6 +123,19 @@ export interface ContainerInfo {
     run_id: string | null;
     started_at: string | null;
     memory_usage_mb: number | null;
+    cpu_percent: number | null;
+}
+
+export interface NotebookMonitorInfo {
+    id: string;
+    name: string;
+    owner_username: string;
+    status: string;
+    url: string | null;
+    port: number | null;
+    cpu_percent: number | null;
+    memory_mb: number | null;
+    started_at: string | null;
 }
 
 export interface TokenResponse {
@@ -136,6 +149,8 @@ export interface Notebook {
     description?: string;
     owner_id: string;
     owner_username: string;
+    folder: 'personal' | 'shared';
+    shared_from?: string | null;
     status: 'stopped' | 'running' | 'paused';
     created_at: string;
     updated_at?: string;

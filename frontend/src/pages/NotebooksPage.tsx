@@ -3,9 +3,10 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/client';
 import {
     Loader2, Plus, Play, Pause, Square, Trash2, Code, Search,
-    ArrowLeft, ExternalLink, User, Calendar, X,
+    ArrowLeft, ExternalLink, User, Calendar, X, Copy, FolderOpen, Globe, Share2, XCircle,
 } from 'lucide-react';
 import type { Notebook } from '../types';
+import { useAuthStore } from '../stores/auth';
 
 export default function NotebooksPage() {
     const queryClient = useQueryClient();
@@ -14,12 +15,21 @@ export default function NotebooksPage() {
     const [newName, setNewName] = useState('');
     const [newDesc, setNewDesc] = useState('');
     const [openNotebook, setOpenNotebook] = useState<Notebook | null>(null);
+    const [activeTab, setActiveTab] = useState<'personal' | 'shared'>('personal');
+    const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
     const iframeRef = useRef<HTMLIFrameElement>(null);
+    const { user } = useAuthStore();
+    const isAdmin = user?.role === 'admin';
 
     const { data: notebooks, isLoading } = useQuery({
         queryKey: ['notebooks'],
         queryFn: () => api.getNotebooks(),
         refetchInterval: 5000,
+    });
+
+    const { data: sharedNotebooks, isLoading: sharedLoading } = useQuery({
+        queryKey: ['notebooks-shared'],
+        queryFn: () => api.getSharedNotebooks(),
     });
 
     const createMutation = useMutation({
@@ -32,11 +42,34 @@ export default function NotebooksPage() {
         },
     });
 
+    const copyMutation = useMutation({
+        mutationFn: (id: string) => api.copySharedNotebook(id),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['notebooks'] });
+            setActiveTab('personal');
+        },
+    });
+
+    const shareMutation = useMutation({
+        mutationFn: (id: string) => api.shareNotebook(id),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['notebooks'] });
+            queryClient.invalidateQueries({ queryKey: ['notebooks-shared'] });
+        },
+    });
+
+    const unshareMutation = useMutation({
+        mutationFn: (id: string) => api.unshareNotebook(id),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['notebooks'] });
+            queryClient.invalidateQueries({ queryKey: ['notebooks-shared'] });
+        },
+    });
+
     const startMutation = useMutation({
         mutationFn: (id: string) => api.startNotebook(id),
         onSuccess: (data) => {
             queryClient.invalidateQueries({ queryKey: ['notebooks'] });
-            // Auto-open notebook when started
             setOpenNotebook(data as Notebook);
         },
     });
@@ -56,7 +89,11 @@ export default function NotebooksPage() {
 
     const deleteMutation = useMutation({
         mutationFn: (id: string) => api.deleteNotebook(id),
-        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['notebooks'] }),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['notebooks'] });
+            queryClient.invalidateQueries({ queryKey: ['notebooks-shared'] });
+            setDeleteConfirmId(null);
+        },
     });
 
     // Keep open notebook in sync with API state
@@ -67,11 +104,18 @@ export default function NotebooksPage() {
         }
     }, [notebooks]);
 
-    const filtered = (notebooks || []).filter(nb =>
+    const currentList = activeTab === 'personal' ? (notebooks || []) : (sharedNotebooks || []);
+    const filtered = currentList.filter(nb =>
         nb.name.toLowerCase().includes(search.toLowerCase()) ||
         (nb.description || '').toLowerCase().includes(search.toLowerCase()) ||
         nb.owner_username.toLowerCase().includes(search.toLowerCase())
     );
+
+    // Build map: personalNotebookId → sharedNotebookId (for toggle logic)
+    const sharedMap = new Map<string, string>();
+    (sharedNotebooks || []).forEach(nb => {
+        if (nb.shared_from) sharedMap.set(nb.shared_from, nb.id);
+    });
 
     const statusColor = (status: string) => {
         switch (status) {
@@ -220,11 +264,39 @@ export default function NotebooksPage() {
                     <h1 className="text-2xl font-bold">Notebooks</h1>
                     <p className="text-sm text-muted-foreground mt-1">Interactive data exploration environments</p>
                 </div>
+                {activeTab === 'personal' && (
+                    <button
+                        onClick={() => setShowCreate(!showCreate)}
+                        className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors"
+                    >
+                        <Plus className="w-4 h-4" /> New Notebook
+                    </button>
+                )}
+            </div>
+
+            {/* Tabs: My Notebooks / Shared Library */}
+            <div className="flex gap-1 mb-6 bg-card border border-border rounded-xl p-1">
                 <button
-                    onClick={() => setShowCreate(!showCreate)}
-                    className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors"
+                    onClick={() => setActiveTab('personal')}
+                    className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${activeTab === 'personal'
+                        ? 'bg-primary text-primary-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+                        }`}
                 >
-                    <Plus className="w-4 h-4" /> New Notebook
+                    <FolderOpen className="w-4 h-4" />
+                    My Notebooks
+                    {notebooks && <span className="text-xs opacity-75">({notebooks.length})</span>}
+                </button>
+                <button
+                    onClick={() => setActiveTab('shared')}
+                    className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${activeTab === 'shared'
+                        ? 'bg-primary text-primary-foreground shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-accent'
+                        }`}
+                >
+                    <Globe className="w-4 h-4" />
+                    Shared Library
+                    {sharedNotebooks && <span className="text-xs opacity-75">({sharedNotebooks.length})</span>}
                 </button>
             </div>
 
@@ -235,7 +307,7 @@ export default function NotebooksPage() {
                     type="text"
                     value={search}
                     onChange={(e) => setSearch(e.target.value)}
-                    placeholder="Search notebooks by name, description, or owner..."
+                    placeholder={activeTab === 'personal' ? 'Search your notebooks...' : 'Search shared notebooks...'}
                     className="w-full pl-10 pr-10 py-2.5 bg-card border border-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 transition-all"
                 />
                 {search && (
@@ -248,8 +320,8 @@ export default function NotebooksPage() {
                 )}
             </div>
 
-            {/* Create form */}
-            {showCreate && (
+            {/* Create form (only on personal tab) */}
+            {showCreate && activeTab === 'personal' && (
                 <div className="bg-card border border-border rounded-xl p-5 mb-6 animate-fade-in">
                     <h3 className="text-sm font-semibold mb-3">Create New Notebook</h3>
                     <div className="space-y-3">
@@ -290,15 +362,47 @@ export default function NotebooksPage() {
                 </div>
             )}
 
+            {/* Delete Confirmation Modal */}
+            {deleteConfirmId && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 animate-fade-in">
+                    <div className="bg-card border border-border rounded-xl p-6 max-w-md mx-4 shadow-2xl">
+                        <h3 className="font-semibold text-lg mb-2">Delete Notebook</h3>
+                        <p className="text-sm text-muted-foreground mb-6">
+                            Are you sure you want to delete this notebook? This action cannot be undone.
+                        </p>
+                        <div className="flex gap-3 justify-end">
+                            <button onClick={() => setDeleteConfirmId(null)} className="px-4 py-2 border border-border rounded-lg text-sm hover:bg-accent">Cancel</button>
+                            <button
+                                onClick={() => deleteMutation.mutate(deleteConfirmId)}
+                                disabled={deleteMutation.isPending}
+                                className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-500 disabled:opacity-50"
+                            >
+                                {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Shared tab info banner */}
+            {activeTab === 'shared' && (
+                <div className="flex items-center gap-3 bg-blue-500/5 border border-blue-500/20 text-blue-300 rounded-xl px-4 py-3 mb-6 text-sm">
+                    <Globe className="w-5 h-5 flex-shrink-0" />
+                    <span>Shared notebooks are <strong>read-only</strong>. Click <strong>Copy to My Notebooks</strong> to create your own editable copy.</span>
+                </div>
+            )}
+
             {/* Gallery grid */}
-            {filtered.length === 0 ? (
+            {(activeTab === 'shared' ? sharedLoading : false) ? (
+                <div className="flex justify-center py-20"><Loader2 className="w-8 h-8 animate-spin text-primary" /></div>
+            ) : filtered.length === 0 ? (
                 <div className="bg-card border border-border rounded-xl p-12 text-center">
                     <Code className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
                     <h2 className="text-lg font-semibold mb-2">
-                        {search ? 'No notebooks match your search' : 'No Notebooks Yet'}
+                        {search ? 'No notebooks match your search' : activeTab === 'personal' ? 'No Notebooks Yet' : 'No Shared Notebooks'}
                     </h2>
                     <p className="text-sm text-muted-foreground">
-                        {search ? 'Try a different search term.' : 'Create a notebook to start exploring data interactively.'}
+                        {search ? 'Try a different search term.' : activeTab === 'personal' ? 'Create a notebook to start exploring data interactively.' : 'No shared notebooks are available yet.'}
                     </p>
                 </div>
             ) : (
@@ -306,25 +410,32 @@ export default function NotebooksPage() {
                     {filtered.map((nb: Notebook) => (
                         <div
                             key={nb.id}
-                            onClick={() => setOpenNotebook(nb)}
-                            className="bg-card border border-border rounded-xl p-5 cursor-pointer hover:border-primary/40 hover:shadow-lg hover:shadow-primary/5 transition-all group"
+                            onClick={() => activeTab === 'personal' ? setOpenNotebook(nb) : undefined}
+                            className={`bg-card border border-border rounded-xl p-5 transition-all group ${activeTab === 'personal' ? 'cursor-pointer hover:border-primary/40 hover:shadow-lg hover:shadow-primary/5' : ''}`}
                         >
                             {/* Card header */}
                             <div className="flex items-start justify-between mb-3">
                                 <div className="flex items-center gap-2.5 min-w-0">
-                                    <div className="w-9 h-9 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0 group-hover:bg-primary/20 transition-colors">
-                                        <Code className="w-4 h-4 text-primary" />
+                                    <div className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 transition-colors ${activeTab === 'shared' ? 'bg-blue-500/10 group-hover:bg-blue-500/20' : 'bg-primary/10 group-hover:bg-primary/20'}`}>
+                                        {activeTab === 'shared' ? <Globe className="w-4 h-4 text-blue-400" /> : <Code className="w-4 h-4 text-primary" />}
                                     </div>
                                     <div className="min-w-0">
-                                        <h3 className="font-semibold text-sm truncate group-hover:text-primary transition-colors">
+                                        <h3 className={`font-semibold text-sm truncate transition-colors ${activeTab === 'personal' ? 'group-hover:text-primary' : ''}`}>
                                             {nb.name}
                                         </h3>
                                     </div>
                                 </div>
-                                <span className={`text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full border flex-shrink-0 ${statusColor(nb.status)}`}>
-                                    {nb.status === 'running' && <span className="inline-block w-1 h-1 rounded-full bg-emerald-400 mr-1 animate-pulse" />}
-                                    {nb.status}
-                                </span>
+                                {activeTab === 'personal' && (
+                                    <span className={`text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full border flex-shrink-0 ${statusColor(nb.status)}`}>
+                                        {nb.status === 'running' && <span className="inline-block w-1 h-1 rounded-full bg-emerald-400 mr-1 animate-pulse" />}
+                                        {nb.status}
+                                    </span>
+                                )}
+                                {activeTab === 'shared' && (
+                                    <span className="text-[10px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full border text-blue-400 bg-blue-500/10 border-blue-500/20 flex-shrink-0">
+                                        shared
+                                    </span>
+                                )}
                             </div>
 
                             {/* Description */}
@@ -344,60 +455,122 @@ export default function NotebooksPage() {
                                 </span>
                             </div>
 
-                            {/* Actions (stop propagation so card click doesn't fire) */}
+                            {/* Actions */}
                             <div className="flex items-center gap-1 mt-3 pt-2 border-t border-border/50" onClick={(e) => e.stopPropagation()}>
-                                {nb.status === 'stopped' && (
-                                    <button
-                                        onClick={() => startMutation.mutate(nb.id)}
-                                        disabled={startMutation.isPending}
-                                        className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-emerald-400 hover:bg-emerald-500/10 transition-colors"
-                                    >
-                                        <Play className="w-3 h-3" /> Start
-                                    </button>
-                                )}
-                                {nb.status === 'running' && (
+                                {activeTab === 'personal' && (
                                     <>
-                                        <button
-                                            onClick={() => pauseMutation.mutate(nb.id)}
-                                            className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-amber-400 hover:bg-amber-500/10 transition-colors"
-                                        >
-                                            <Pause className="w-3 h-3" /> Pause
-                                        </button>
-                                        <button
-                                            onClick={() => stopMutation.mutate(nb.id)}
-                                            className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-red-400 hover:bg-red-500/10 transition-colors"
-                                        >
-                                            <Square className="w-3 h-3" /> Stop
-                                        </button>
+                                        {nb.status === 'stopped' && (
+                                            <button
+                                                onClick={() => startMutation.mutate(nb.id)}
+                                                disabled={startMutation.isPending}
+                                                className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-emerald-400 hover:bg-emerald-500/10 transition-colors"
+                                            >
+                                                <Play className="w-3 h-3" /> Start
+                                            </button>
+                                        )}
+                                        {nb.status === 'running' && (
+                                            <>
+                                                <button
+                                                    onClick={() => pauseMutation.mutate(nb.id)}
+                                                    className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-amber-400 hover:bg-amber-500/10 transition-colors"
+                                                >
+                                                    <Pause className="w-3 h-3" /> Pause
+                                                </button>
+                                                <button
+                                                    onClick={() => stopMutation.mutate(nb.id)}
+                                                    className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-red-400 hover:bg-red-500/10 transition-colors"
+                                                >
+                                                    <Square className="w-3 h-3" /> Stop
+                                                </button>
+                                            </>
+                                        )}
+                                        {nb.status === 'paused' && (
+                                            <>
+                                                <button
+                                                    onClick={() => startMutation.mutate(nb.id)}
+                                                    className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-emerald-400 hover:bg-emerald-500/10 transition-colors"
+                                                >
+                                                    <Play className="w-3 h-3" /> Resume
+                                                </button>
+                                                <button
+                                                    onClick={() => stopMutation.mutate(nb.id)}
+                                                    className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-red-400 hover:bg-red-500/10 transition-colors"
+                                                >
+                                                    <Square className="w-3 h-3" /> Stop
+                                                </button>
+                                            </>
+                                        )}
+                                        <div className="flex-1" />
+                                        {nb.status !== 'running' && (
+                                            <>
+                                                {sharedMap.has(nb.id) ? (
+                                                    <button
+                                                        onClick={() => unshareMutation.mutate(sharedMap.get(nb.id)!)}
+                                                        disabled={unshareMutation.isPending}
+                                                        className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-amber-400 hover:bg-amber-500/10 transition-colors disabled:opacity-50"
+                                                        title="Remove from Shared Library"
+                                                    >
+                                                        <XCircle className="w-3 h-3" />
+                                                        Unshare
+                                                    </button>
+                                                ) : (
+                                                    <button
+                                                        onClick={() => shareMutation.mutate(nb.id)}
+                                                        disabled={shareMutation.isPending}
+                                                        className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-blue-400 hover:bg-blue-500/10 transition-colors disabled:opacity-50"
+                                                        title="Share to Shared Library"
+                                                    >
+                                                        <Share2 className="w-3 h-3" />
+                                                        Share
+                                                    </button>
+                                                )}
+                                                <button
+                                                    onClick={() => setDeleteConfirmId(nb.id)}
+                                                    className="p-1 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                                                    title="Delete"
+                                                >
+                                                    <Trash2 className="w-3 h-3" />
+                                                </button>
+                                            </>
+                                        )}
                                     </>
                                 )}
-                                {nb.status === 'paused' && (
+                                {activeTab === 'shared' && (
                                     <>
                                         <button
-                                            onClick={() => startMutation.mutate(nb.id)}
-                                            className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-emerald-400 hover:bg-emerald-500/10 transition-colors"
+                                            onClick={() => copyMutation.mutate(nb.id)}
+                                            disabled={copyMutation.isPending}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 transition-colors disabled:opacity-50"
                                         >
-                                            <Play className="w-3 h-3" /> Resume
+                                            {copyMutation.isPending ? (
+                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                            ) : (
+                                                <Copy className="w-3 h-3" />
+                                            )}
+                                            Copy to My Notebooks
                                         </button>
-                                        <button
-                                            onClick={() => stopMutation.mutate(nb.id)}
-                                            className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs text-red-400 hover:bg-red-500/10 transition-colors"
-                                        >
-                                            <Square className="w-3 h-3" /> Stop
-                                        </button>
+                                        {nb.owner_id === user?.id && (
+                                            <button
+                                                onClick={() => unshareMutation.mutate(nb.id)}
+                                                disabled={unshareMutation.isPending}
+                                                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-amber-400 hover:bg-amber-500/10 transition-colors disabled:opacity-50"
+                                                title="Remove from Shared Library"
+                                            >
+                                                <XCircle className="w-3 h-3" />
+                                                Unshare
+                                            </button>
+                                        )}
+                                        <div className="flex-1" />
+                                        {isAdmin && (
+                                            <button
+                                                onClick={() => setDeleteConfirmId(nb.id)}
+                                                className="p-1 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                                                title="Delete from Shared Library (Admin)"
+                                            >
+                                                <Trash2 className="w-3 h-3" />
+                                            </button>
+                                        )}
                                     </>
-                                )}
-                                <div className="flex-1" />
-                                {nb.status !== 'running' && (
-                                    <button
-                                        onClick={() => {
-                                            if (confirm(`Delete "${nb.name}"?`)) deleteMutation.mutate(nb.id);
-                                        }}
-                                        className="p-1 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                                        title="Delete"
-                                    >
-                                        <Trash2 className="w-3 h-3" />
-                                    </button>
                                 )}
                             </div>
                         </div>

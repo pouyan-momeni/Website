@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/client';
-import { Loader2, Plus, UserX } from 'lucide-react';
+import { Loader2, Plus, Trash2, AlertTriangle } from 'lucide-react';
 
 export default function UserManagementPage() {
     const queryClient = useQueryClient();
     const [showForm, setShowForm] = useState(false);
     const [newUser, setNewUser] = useState({ ldap_username: '', email: '', role: 'reader' });
+    const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; username: string } | null>(null);
 
     const { data: users, isLoading } = useQuery({
         queryKey: ['users'],
@@ -27,9 +28,12 @@ export default function UserManagementPage() {
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ['users'] }),
     });
 
-    const deactivateMutation = useMutation({
-        mutationFn: (userId: string) => api.deactivateUser(userId),
-        onSuccess: () => queryClient.invalidateQueries({ queryKey: ['users'] }),
+    const deleteMutation = useMutation({
+        mutationFn: (userId: string) => api.deleteUser(userId),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['users'] });
+            setDeleteConfirm(null);
+        },
     });
 
     return (
@@ -105,6 +109,45 @@ export default function UserManagementPage() {
                 </div>
             )}
 
+            {/* Delete confirmation dialog */}
+            {deleteConfirm && (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 animate-fade-in">
+                    <div className="bg-card border border-border rounded-xl p-6 max-w-md mx-4 shadow-2xl">
+                        <div className="flex items-center gap-3 mb-4">
+                            <div className="w-10 h-10 rounded-full bg-red-500/10 flex items-center justify-center">
+                                <AlertTriangle className="w-5 h-5 text-red-400" />
+                            </div>
+                            <div>
+                                <h3 className="font-semibold text-lg">Delete User</h3>
+                                <p className="text-sm text-muted-foreground">This action cannot be undone.</p>
+                            </div>
+                        </div>
+                        <p className="text-sm text-muted-foreground mb-6">
+                            Are you sure you want to permanently delete user <strong className="text-foreground">'{deleteConfirm.username}'</strong>?
+                            All associated data will be removed.
+                        </p>
+                        <div className="flex gap-3 justify-end">
+                            <button
+                                onClick={() => setDeleteConfirm(null)}
+                                className="px-4 py-2 border border-border rounded-lg text-sm hover:bg-accent"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={() => deleteMutation.mutate(deleteConfirm.id)}
+                                disabled={deleteMutation.isPending}
+                                className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-500 disabled:opacity-50"
+                            >
+                                {deleteMutation.isPending ? 'Deleting...' : 'Delete User'}
+                            </button>
+                        </div>
+                        {deleteMutation.isError && (
+                            <p className="text-sm text-red-400 mt-3">{(deleteMutation.error as Error).message}</p>
+                        )}
+                    </div>
+                </div>
+            )}
+
             {/* Users table */}
             {isLoading ? (
                 <div className="flex justify-center py-20"><Loader2 className="w-8 h-8 animate-spin text-primary" /></div>
@@ -116,20 +159,18 @@ export default function UserManagementPage() {
                                 <th className="px-4 py-3 font-medium">Username</th>
                                 <th className="px-4 py-3 font-medium">Email</th>
                                 <th className="px-4 py-3 font-medium">Role</th>
-                                <th className="px-4 py-3 font-medium">Status</th>
                                 <th className="px-4 py-3 font-medium">Actions</th>
                             </tr>
                         </thead>
                         <tbody>
                             {users?.map(user => (
-                                <tr key={user.id} className={`border-b border-border/50 hover:bg-accent/30 transition-colors ${!user.is_active ? 'opacity-50' : ''}`}>
+                                <tr key={user.id} className="border-b border-border/50 hover:bg-accent/30 transition-colors">
                                     <td className="px-4 py-3 font-medium">{user.ldap_username}</td>
                                     <td className="px-4 py-3 text-muted-foreground">{user.email || '—'}</td>
                                     <td className="px-4 py-3">
                                         <select
                                             value={user.role}
                                             onChange={(e) => updateRoleMutation.mutate({ userId: user.id, role: e.target.value })}
-                                            disabled={!user.is_active}
                                             className="px-2 py-1 bg-background border border-border rounded text-sm focus:ring-primary/50"
                                         >
                                             <option value="reader">Reader</option>
@@ -139,21 +180,13 @@ export default function UserManagementPage() {
                                         </select>
                                     </td>
                                     <td className="px-4 py-3">
-                                        <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${user.is_active ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-red-500/10 text-red-400 border border-red-500/20'
-                                            }`}>
-                                            {user.is_active ? 'Active' : 'Inactive'}
-                                        </span>
-                                    </td>
-                                    <td className="px-4 py-3">
-                                        {user.is_active && (
-                                            <button
-                                                onClick={() => deactivateMutation.mutate(user.id)}
-                                                className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
-                                                title="Deactivate"
-                                            >
-                                                <UserX className="w-4 h-4" />
-                                            </button>
-                                        )}
+                                        <button
+                                            onClick={() => setDeleteConfirm({ id: user.id, username: user.ldap_username })}
+                                            className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                                            title="Delete user permanently"
+                                        >
+                                            <Trash2 className="w-4 h-4" />
+                                        </button>
                                     </td>
                                 </tr>
                             ))}
