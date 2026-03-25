@@ -1,6 +1,7 @@
 """Docker container runner using docker-py SDK."""
 
 import logging
+import re
 import shlex
 from dataclasses import dataclass, field
 from typing import Optional
@@ -56,7 +57,27 @@ class DockerRunner:
                 "Images must be pre-pulled or built before use. This platform does not pull images."
             )
 
-    def _parse_extra_args(self, extra_args: str) -> dict:
+    def _substitute_variables(self, text: str, run_inputs: dict) -> str:
+        """Replace $variable references in text with values from run_inputs.
+
+        Supports:
+            $variable_name  → replaced with run_inputs["variable_name"]
+            ${variable_name} → same, explicit delimiters
+        Unmatched variables are left as-is.
+        """
+        if not run_inputs:
+            return text
+
+        def replace_match(m):
+            var_name = m.group(1) or m.group(2)
+            if var_name in run_inputs:
+                return str(run_inputs[var_name])
+            return m.group(0)  # leave unmatched as-is
+
+        # Match ${name} or $name (word characters only)
+        return re.sub(r'\$\{(\w+)\}|\$(\w+)', replace_match, text)
+
+    def _parse_extra_args(self, extra_args: str, run_inputs: dict = None) -> dict:
         """Parse extra_args string into Docker SDK kwargs.
 
         Supports:
@@ -71,66 +92,82 @@ class DockerRunner:
             --rm                  → remove (ignored, we handle cleanup)
             --user USER           → user
             --label KEY=VALUE     → labels
-        Other flags are logged as warnings and skipped.
+
+        Any trailing non-flag arguments (after all flags) are treated as
+        the container command, e.g.:
+            --user test -v /a:/b  python ./src/test.py arg1 arg2
+        In this example, 'python ./src/test.py arg1 arg2' becomes the command.
+
+        $variable references are substituted with values from run_inputs.
         """
         if not extra_args or not extra_args.strip():
             return {}
+
+        # Substitute variables before parsing
+        if run_inputs:
+            extra_args = self._substitute_variables(extra_args, run_inputs)
 
         args = shlex.split(extra_args)
         env = {}
         volumes = {}
         kwargs = {}
         labels = {}
+        command_parts = []
         i = 0
 
         while i < len(args):
             arg = args[i]
-            if arg in ("-e", "--env") and i + 1 < len(args):
-                i += 1
-                kv = args[i]
-                if "=" in kv:
-                    k, v = kv.split("=", 1)
-                    env[k] = v
-            elif arg in ("-v", "--volume") and i + 1 < len(args):
-                i += 1
-                parts = args[i].split(":")
-                if len(parts) >= 2:
-                    host_path = parts[0]
-                    container_path = parts[1]
-                    mode = parts[2] if len(parts) > 2 else "rw"
-                    volumes[host_path] = {"bind": container_path, "mode": mode}
-            elif arg == "--network" and i + 1 < len(args):
-                i += 1
-                kwargs["network"] = args[i]
-            elif arg == "--memory" and i + 1 < len(args):
-                i += 1
-                kwargs["mem_limit"] = args[i]
-            elif arg == "--cpus" and i + 1 < len(args):
-                i += 1
-                try:
-                    kwargs["nano_cpus"] = int(float(args[i]) * 1e9)
-                except ValueError:
-                    pass
-            elif arg == "--workdir" and i + 1 < len(args):
-                i += 1
-                kwargs["working_dir"] = args[i]
-            elif arg == "--entrypoint" and i + 1 < len(args):
-                i += 1
-                kwargs["entrypoint"] = args[i]
-            elif arg == "--user" and i + 1 < len(args):
-                i += 1
-                kwargs["user"] = args[i]
-            elif arg == "--label" and i + 1 < len(args):
-                i += 1
-                if "=" in args[i]:
-                    lk, lv = args[i].split("=", 1)
-                    labels[lk] = lv
-            elif arg in ("--rm", "--name"):
-                # Skip --rm (we handle cleanup) and --name (we set our own)
-                if arg == "--name" and i + 1 < len(args):
-                    i += 1  # skip the name value too
+            if arg.startswith('-'):
+                if arg in ("-e", "--env") and i + 1 < len(args):
+                    i += 1
+                    kv = args[i]
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        env[k] = v
+                elif arg in ("-v", "--volume") and i + 1 < len(args):
+                    i += 1
+                    parts = args[i].split(":")
+                    if len(parts) >= 2:
+                        host_path = parts[0]
+                        container_path = parts[1]
+                        mode = parts[2] if len(parts) > 2 else "rw"
+                        volumes[host_path] = {"bind": container_path, "mode": mode}
+                elif arg == "--network" and i + 1 < len(args):
+                    i += 1
+                    kwargs["network"] = args[i]
+                elif arg == "--memory" and i + 1 < len(args):
+                    i += 1
+                    kwargs["mem_limit"] = args[i]
+                elif arg == "--cpus" and i + 1 < len(args):
+                    i += 1
+                    try:
+                        kwargs["nano_cpus"] = int(float(args[i]) * 1e9)
+                    except ValueError:
+                        pass
+                elif arg == "--workdir" and i + 1 < len(args):
+                    i += 1
+                    kwargs["working_dir"] = args[i]
+                elif arg == "--entrypoint" and i + 1 < len(args):
+                    i += 1
+                    kwargs["entrypoint"] = args[i]
+                elif arg == "--user" and i + 1 < len(args):
+                    i += 1
+                    kwargs["user"] = args[i]
+                elif arg == "--label" and i + 1 < len(args):
+                    i += 1
+                    if "=" in args[i]:
+                        lk, lv = args[i].split("=", 1)
+                        labels[lk] = lv
+                elif arg in ("--rm", "--name"):
+                    # Skip --rm (we handle cleanup) and --name (we set our own)
+                    if arg == "--name" and i + 1 < len(args):
+                        i += 1  # skip the name value too
+                else:
+                    logger.warning("Unrecognized docker run arg: %s", arg)
             else:
-                logger.warning("Unrecognized docker run arg: %s", arg)
+                # Non-flag argument: this starts the command
+                command_parts = args[i:]
+                break
             i += 1
 
         result = {}
@@ -140,6 +177,8 @@ class DockerRunner:
             result["volumes"] = volumes
         if labels:
             result["labels"] = labels
+        if command_parts:
+            result["command"] = command_parts
         result.update(kwargs)
         return result
 
@@ -150,6 +189,7 @@ class DockerRunner:
         extra_args: str,
         run_id: str,
         container_name: str,
+        run_inputs: dict = None,
     ) -> ContainerResult:
         """
         Run a Docker container synchronously, streaming logs to Redis pub/sub.
@@ -157,9 +197,10 @@ class DockerRunner:
         Args:
             image: Docker image name:tag.
             volumes: Volume mount dict, e.g. {'/host/path': {'bind': '/container/path', 'mode': 'rw'}}.
-            extra_args: Raw docker run arguments string.
+            extra_args: Raw docker run arguments string (supports $variable substitution).
             run_id: UUID of the run (used for labeling and log channel).
             container_name: Human-readable name for the container step.
+            run_inputs: Dict of model run inputs for $variable substitution.
 
         Returns:
             ContainerResult with exit code, full log text, and container ID.
@@ -169,8 +210,8 @@ class DockerRunner:
         """
         self._validate_image_exists(image)
 
-        # Parse extra_args into Docker SDK kwargs
-        parsed = self._parse_extra_args(extra_args)
+        # Parse extra_args into Docker SDK kwargs (with variable substitution)
+        parsed = self._parse_extra_args(extra_args, run_inputs=run_inputs)
 
         # Merge volumes: extra_args volumes override/extend base volumes
         merged_volumes = dict(volumes)
@@ -189,12 +230,16 @@ class DockerRunner:
         if "labels" in parsed:
             labels.update(parsed.pop("labels"))
 
+        # Extract command if present
+        command = parsed.pop("command", None)
+
         log_channel = f"run:{run_id}:logs"
 
         logger.info("Starting container '%s' (image: %s) for run %s", container_name, image, run_id)
 
         container = self._client.containers.run(
             image=image,
+            command=command,
             environment=environment,
             volumes=merged_volumes,
             labels=labels,

@@ -294,7 +294,7 @@ def _trigger_run_for_schedule(sched: dict):
     import os
     import uuid as uuid_mod
 
-    from backend.api.runs import _DEV_RUNS, _DEV_LOGS, _simulate_run, _get_model_config, _get_model_name
+    from backend.api.runs import _DEV_RUNS, _DEV_LOGS, _run_model, _get_model_config, _get_model_name
 
     run_id = str(uuid_mod.uuid4())
     model_id = sched["model_id"]
@@ -343,7 +343,7 @@ def _trigger_run_for_schedule(sched: dict):
     _DEV_RUNS[run_id] = run
     _DEV_LOGS[run_id] = [f"[system] Run {run_id} triggered by schedule {sched['id']}"]
 
-    thread = threading.Thread(target=_simulate_run, args=(run_id,), daemon=True)
+    thread = threading.Thread(target=_run_model, args=(run_id,), daemon=True)
     thread.start()
 
     # Audit log from background thread — use sync DB to avoid async event loop issues

@@ -247,6 +247,7 @@ def execute_model_run(self, run_id: str) -> dict:
                         extra_args=extra_args,
                         run_id=run_id,
                         container_name=container_name,
+                        run_inputs=run.inputs or {},
                     )
 
                     # Write log to file

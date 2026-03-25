@@ -34,7 +34,7 @@ router = APIRouter(prefix="/api/runs", tags=["runs"])
 _DEV_RUNS: dict[str, dict] = {}
 _DEV_LOGS: dict[str, list[str]] = {}
 _ACTIVE_RUN_IDS: set[str] = set()  # Tracks runs that have simulation threads
-MAX_CONCURRENT_RUNS = 2  # Only 2 runs can execute simultaneously; others wait in queue
+MAX_CONCURRENT_RUNS = 1  # Only 1 run can execute simultaneously; others wait in queue
 
 
 def _get_model_name(model_id: str, db_session=None) -> str:
@@ -79,6 +79,32 @@ def _get_model_config(model_id: str) -> dict:
     except Exception:
         pass
     return {}
+
+
+def _get_model_docker_images(model_id: str) -> list[dict]:
+    """Get the docker_images list for a model (from memory or DB)."""
+    from backend.api.models import _DEV_MODELS
+    model = _DEV_MODELS.get(model_id)
+    if model and model.get("docker_images"):
+        imgs = list(model["docker_images"])
+        imgs.sort(key=lambda x: x.get("order", 0))
+        return imgs
+    # Check DB
+    try:
+        from backend.config import settings
+        from sqlalchemy import create_engine, text
+        sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+        with sync_engine.connect() as conn:
+            result = conn.execute(text("SELECT docker_images FROM models WHERE id = :id"), {"id": model_id})
+            row = result.fetchone()
+            if row and row[0]:
+                imgs = list(row[0])
+                imgs.sort(key=lambda x: x.get("order", 0))
+                return imgs
+        sync_engine.dispose()
+    except Exception:
+        pass
+    return []
 
 
 def _generate_sample_outputs(run_id: str, output_path: str, model_name: str):
@@ -201,15 +227,33 @@ def _generate_sample_outputs(run_id: str, output_path: str, model_name: str):
         }, f, indent=2)
 
 
-def _simulate_run(run_id: str):
-    """Background thread to simulate a model run progressing through steps."""
+def _run_model(run_id: str):
+    """Background thread to run a model.
+
+    For test models (hardcoded demo IDs), uses simulated progress.
+    For real models, uses DockerRunner to execute actual containers.
+    """
     run = _DEV_RUNS.get(run_id)
     if not run:
         return
 
-    model_name = _get_model_name(run["model_id"])
-    containers = ["data-updater", "analyze", "backtest"]
+    model_id = run["model_id"]
+    model_name = _get_model_name(model_id)
+    docker_images = _get_model_docker_images(model_id)
     logs = _DEV_LOGS.setdefault(run_id, [])
+
+    # Determine if this is a test/demo model
+    _TEST_MODEL_IDS = {
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+        "33333333-3333-3333-3333-333333333333",
+    }
+    is_test_model = model_id in _TEST_MODEL_IDS
+
+    if docker_images:
+        containers = [img.get("name", f"step-{img.get('order', i+1)}") for i, img in enumerate(docker_images)]
+    else:
+        containers = ["step-1"]
 
     time.sleep(1)
 
@@ -226,39 +270,141 @@ def _simulate_run(run_id: str):
     run["queue_position"] = None
     logs.append(f"[system] Starting run for {model_name}")
 
-    for idx, container in enumerate(containers):
-        if run.get("_cancelled"):
-            run["status"] = "cancelled"
-            run["completed_at"] = datetime.now(timezone.utc).isoformat()
-            logs.append(f"[system] Run cancelled during {container}")
-            _ACTIVE_RUN_IDS.discard(run_id)
-            _try_start_next_run()
-            return
-
-        run["current_container_index"] = idx
-        logs.append(f"[{container}] Starting container {idx + 1}/{len(containers)}...")
-
-        steps = 5 if container == "data-updater" else 8 if container == "analyze" else 6
-        for step in range(steps):
+    if is_test_model:
+        # ── Simulated run for test/demo models ──
+        for idx, container in enumerate(containers):
             if run.get("_cancelled"):
                 run["status"] = "cancelled"
                 run["completed_at"] = datetime.now(timezone.utc).isoformat()
                 logs.append(f"[system] Run cancelled during {container}")
+                _ACTIVE_RUN_IDS.discard(run_id)
+                _try_start_next_run()
                 return
-            progress = ((step + 1) / steps) * 100
-            logs.append(f"[{container}] Progress: {progress:.0f}%")
-            time.sleep(0.5)
 
-        logs.append(f"[{container}] Container completed successfully")
+            run["current_container_index"] = idx
+            logs.append(f"[{container}] Starting container {idx + 1}/{len(containers)}...")
 
-    # Generate output files
-    output_path = run.get("output_path", f"/tmp/alm-runs/{run_id}/outputs")
-    _generate_sample_outputs(run_id, output_path, model_name)
-    logs.append(f"[system] Output files generated at {output_path}")
+            steps = 5 if container == "data-updater" else 8 if container == "analyze" else 6
+            for step in range(steps):
+                if run.get("_cancelled"):
+                    run["status"] = "cancelled"
+                    run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    logs.append(f"[system] Run cancelled during {container}")
+                    _ACTIVE_RUN_IDS.discard(run_id)
+                    _try_start_next_run()
+                    return
+                progress = ((step + 1) / steps) * 100
+                logs.append(f"[{container}] Progress: {progress:.0f}%")
+                time.sleep(0.5)
+
+            logs.append(f"[{container}] Container completed successfully")
+
+        # Generate sample output files for test models
+        output_path = run.get("output_path", f"/tmp/alm-runs/{run_id}/outputs")
+        _generate_sample_outputs(run_id, output_path, model_name)
+        logs.append(f"[system] Output files generated at {output_path}")
+
+    else:
+        # ── Real Docker execution for non-test models ──
+        try:
+            from backend.docker_runner.runner import DockerRunner, ImageNotFoundError
+            docker_runner = DockerRunner()
+        except Exception as exc:
+            logs.append(f"[system] ERROR: Failed to initialize Docker runner: {exc}")
+            run["status"] = "failed"
+            run["completed_at"] = datetime.now(timezone.utc).isoformat()
+            _ACTIVE_RUN_IDS.discard(run_id)
+            _try_start_next_run()
+            return
+
+        output_path = run.get("output_path", f"/tmp/alm-runs/{run_id}/outputs")
+        log_path = run.get("log_path", f"/tmp/alm-runs/{run_id}/logs")
+        os.makedirs(output_path, exist_ok=True)
+        os.makedirs(log_path, exist_ok=True)
+
+        # Get run inputs for variable substitution
+        run_inputs = run.get("inputs", {})
+
+        for idx, img_spec in enumerate(docker_images):
+            container_name = img_spec.get("name", f"step-{idx + 1}")
+            image = img_spec.get("image", "")
+            extra_args = img_spec.get("extra_args", "")
+
+            if run.get("_cancelled"):
+                run["status"] = "cancelled"
+                run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                logs.append(f"[system] Run cancelled before {container_name}")
+                _ACTIVE_RUN_IDS.discard(run_id)
+                _try_start_next_run()
+                return
+
+            run["current_container_index"] = idx
+            logs.append(f"[{container_name}] Starting container {idx + 1}/{len(docker_images)} (image: {image})...")
+
+            # Build base volume mounts
+            volumes = {
+                output_path: {"bind": "/data/output", "mode": "rw"},
+                log_path: {"bind": "/data/logs", "mode": "rw"},
+            }
+
+            try:
+                result = docker_runner.run_container(
+                    image=image,
+                    volumes=volumes,
+                    extra_args=extra_args,
+                    run_id=run_id,
+                    container_name=container_name,
+                    run_inputs=run_inputs,
+                )
+
+                # Stream the container's log into _DEV_LOGS
+                if result.log:
+                    for line in result.log.splitlines():
+                        logs.append(f"[{container_name}] {line}")
+
+                # Save container log to file
+                container_log_file = os.path.join(log_path, f"{container_name}.log")
+                with open(container_log_file, "w") as f:
+                    f.write(result.log or "")
+
+                if result.exit_code != 0:
+                    logs.append(f"[{container_name}] Container FAILED with exit code {result.exit_code}")
+                    run["status"] = "failed"
+                    run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    _ACTIVE_RUN_IDS.discard(run_id)
+                    _try_start_next_run()
+                    return
+
+                logs.append(f"[{container_name}] Container completed successfully (exit code 0)")
+
+            except ImageNotFoundError as exc:
+                logs.append(f"[{container_name}] ERROR: {exc}")
+                run["status"] = "failed"
+                run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _ACTIVE_RUN_IDS.discard(run_id)
+                _try_start_next_run()
+                return
+            except Exception as exc:
+                logs.append(f"[{container_name}] ERROR: Container execution failed: {exc}")
+                run["status"] = "failed"
+                run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _ACTIVE_RUN_IDS.discard(run_id)
+                _try_start_next_run()
+                return
+
+        # List the real output files
+        output_files = []
+        for root, dirs, files in os.walk(output_path):
+            for f in files:
+                output_files.append(os.path.join(root, f))
+        if output_files:
+            logs.append(f"[system] {len(output_files)} output file(s) produced")
+        else:
+            logs.append("[system] No output files produced by containers")
 
     run["status"] = "completed"
     run["completed_at"] = datetime.now(timezone.utc).isoformat()
-    logs.append(f"[system] Run completed successfully")
+    logs.append("[system] Run completed successfully")
 
     # Free the slot and try to start the next queued run
     _ACTIVE_RUN_IDS.discard(run_id)
@@ -284,7 +430,7 @@ def _try_start_next_run():
     import logging
     logging.getLogger(__name__).info("Promoting queued run %s to running (slot available)", run_id[:8])
 
-    thread = threading.Thread(target=_simulate_run, args=(run_id,), daemon=True)
+    thread = threading.Thread(target=_run_model, args=(run_id,), daemon=True)
     thread.start()
 
 
@@ -345,7 +491,7 @@ async def create_run(
         # Only start immediately if under the concurrency limit
         if len(_ACTIVE_RUN_IDS) < MAX_CONCURRENT_RUNS:
             _ACTIVE_RUN_IDS.add(run_id)
-            thread = threading.Thread(target=_simulate_run, args=(run_id,), daemon=True)
+            thread = threading.Thread(target=_run_model, args=(run_id,), daemon=True)
             thread.start()
         else:
             _DEV_LOGS[run_id].append(f"[system] Waiting in queue — {len(_ACTIVE_RUN_IDS)} runs already executing (max {MAX_CONCURRENT_RUNS})")
