@@ -141,11 +141,17 @@ async def create_schedule(
     logger.info("Schedule created: %s for model %s, next run: %s", schedule_id, body.model_name, next_run)
 
     from backend.api.audit import log_action
-    log_action(
-        username=current_user.ldap_username, user_id=str(current_user.id),
-        action="create_schedule", resource_type="schedule", resource_id=schedule_id,
-        details={"model_name": body.model_name, "repeat_type": body.repeat_type, "scheduled_at": body.scheduled_at},
-    )
+    from backend.database import get_db
+    from sqlalchemy.ext.asyncio import AsyncSession
+    # Get a DB session for audit logging
+    async for db in get_db():
+        await log_action(
+            username=current_user.ldap_username, user_id=str(current_user.id),
+            action="create_schedule", resource_type="schedule", resource_id=schedule_id,
+            details={"model_name": body.model_name, "repeat_type": body.repeat_type, "scheduled_at": body.scheduled_at},
+            db=db,
+        )
+        break
 
     return schedule
 
@@ -249,31 +255,35 @@ def _execute_due_schedules():
                 # ── Time to execute this schedule ──
                 logger.info("Schedule %s is due (next_run=%s, now=%s) — triggering run", sched_id, next_run_str, now.isoformat())
 
-                try:
-                    _trigger_run_for_schedule(sched)
-                except Exception as exc:
-                    logger.error("Failed to trigger run for schedule %s: %s", sched_id, exc)
-                    continue
-
-                # Update schedule state
+                # Update schedule state FIRST (before trigger) to prevent infinite re-firing
                 sched["last_run_at"] = now.isoformat()
                 sched["executions_done"] = sched.get("executions_done", 0) + 1
 
-                # Check if schedule is exhausted
+                # Check if schedule is exhausted and remove it
+                should_delete = False
                 if sched.get("repeat_count") is not None and sched["executions_done"] >= sched["repeat_count"]:
-                    del _DEV_SCHEDULES[sched_id]
-                    logger.info("Schedule %s exhausted after %d executions — removed", sched_id, sched["executions_done"])
+                    should_delete = True
+                    logger.info("Schedule %s exhausted after %d executions — will remove", sched_id, sched["executions_done"])
                 elif sched["repeat_type"] == "none":
-                    del _DEV_SCHEDULES[sched_id]
-                    logger.info("One-time schedule %s completed — removed", sched_id)
+                    should_delete = True
+                    logger.info("One-time schedule %s completed — will remove", sched_id)
                 else:
                     # Calculate next occurrence
                     sched["next_run_at"] = _calculate_next_run(
-                        now.isoformat(),  # base from now to find next future occurrence
+                        now.isoformat(),
                         sched["repeat_type"],
                         sched.get("cron_expression"),
                     )
                     logger.info("Schedule %s next run: %s", sched_id, sched["next_run_at"])
+
+                if should_delete:
+                    del _DEV_SCHEDULES[sched_id]
+
+                # Now trigger the run (non-fatal — even if this fails, schedule is updated)
+                try:
+                    _trigger_run_for_schedule(sched)
+                except Exception as exc:
+                    logger.error("Failed to trigger run for schedule %s: %s", sched_id, exc)
 
         except Exception as exc:
             logger.error("Schedule executor error: %s", exc)
@@ -284,7 +294,7 @@ def _trigger_run_for_schedule(sched: dict):
     import os
     import uuid as uuid_mod
 
-    from backend.api.runs import _DEV_RUNS, _DEV_LOGS, _simulate_run, _get_model_config
+    from backend.api.runs import _DEV_RUNS, _DEV_LOGS, _simulate_run, _get_model_config, _get_model_name
 
     run_id = str(uuid_mod.uuid4())
     model_id = sched["model_id"]
@@ -312,6 +322,8 @@ def _trigger_run_for_schedule(sched: dict):
     run = {
         "id": run_id,
         "model_id": model_id,
+        "model_name": _get_model_name(model_id),
+        "username": sched.get("created_by_username", "scheduler"),
         "triggered_by": sched.get("created_by", "scheduler"),
         "status": "queued",
         "inputs": sched.get("inputs", {}),
@@ -333,6 +345,40 @@ def _trigger_run_for_schedule(sched: dict):
 
     thread = threading.Thread(target=_simulate_run, args=(run_id,), daemon=True)
     thread.start()
+
+    # Audit log from background thread — use sync DB to avoid async event loop issues
+    try:
+        import uuid as _uuid
+        from backend.models.audit_log import AuditLog as AuditLogModel
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session as SyncSession
+        sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+        with SyncSession(sync_engine) as session:
+            # Convert string IDs to proper UUIDs for the DB
+            user_id_val = None
+            try:
+                user_id_val = _uuid.UUID(sched.get("created_by", ""))
+            except (ValueError, AttributeError):
+                pass
+            resource_id_val = None
+            try:
+                resource_id_val = _uuid.UUID(run_id)
+            except (ValueError, AttributeError):
+                pass
+            entry = AuditLogModel(
+                username=sched.get("created_by_username", "scheduler"),
+                user_id=user_id_val,
+                action="scheduled_run_triggered",
+                resource_type="run",
+                resource_id=resource_id_val,
+                details={"schedule_id": sched["id"], "model_name": sched.get("model_name", "Unknown")},
+            )
+            session.add(entry)
+            session.commit()
+            logger.info("Audit logged scheduled_run_triggered for run %s", run_id)
+        sync_engine.dispose()
+    except Exception as exc:
+        logger.warning("Failed to audit log scheduled run: %s", exc)
 
     logger.info("Triggered run %s for schedule %s (model: %s)", run_id, sched["id"], sched.get("model_name"))
 

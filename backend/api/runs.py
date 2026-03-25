@@ -37,16 +37,48 @@ _ACTIVE_RUN_IDS: set[str] = set()  # Tracks runs that have simulation threads
 MAX_CONCURRENT_RUNS = 2  # Only 2 runs can execute simultaneously; others wait in queue
 
 
-def _get_model_name(model_id: str) -> str:
+def _get_model_name(model_id: str, db_session=None) -> str:
+    """Get model name from memory or DB."""
     from backend.api.models import _DEV_MODELS
     model = _DEV_MODELS.get(model_id)
-    return model["name"] if model else "Unknown Model"
+    if model:
+        return model["name"]
+    # Check DB synchronously using a sync engine
+    try:
+        from backend.config import settings
+        from sqlalchemy import create_engine, text
+        sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+        with sync_engine.connect() as conn:
+            result = conn.execute(text("SELECT name FROM models WHERE id = :id"), {"id": model_id})
+            row = result.fetchone()
+            if row:
+                return row[0]
+        sync_engine.dispose()
+    except Exception:
+        pass
+    return "Unknown Model"
 
 
 def _get_model_config(model_id: str) -> dict:
     from backend.api.models import _DEV_MODELS
     model = _DEV_MODELS.get(model_id)
-    return dict(model.get("default_config", {})) if model else {}
+    if model:
+        return dict(model.get("default_config", {}))
+    # Check DB
+    try:
+        from backend.config import settings
+        from sqlalchemy import create_engine, text
+        import json
+        sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+        with sync_engine.connect() as conn:
+            result = conn.execute(text("SELECT default_config FROM models WHERE id = :id"), {"id": model_id})
+            row = result.fetchone()
+            if row and row[0]:
+                return dict(row[0])
+        sync_engine.dispose()
+    except Exception:
+        pass
+    return {}
 
 
 def _generate_sample_outputs(run_id: str, output_path: str, model_name: str):
@@ -265,7 +297,7 @@ async def create_run(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new run."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         run_id = str(uuid_mod.uuid4())
         model_id = str(body.model_id)
 
@@ -320,10 +352,10 @@ async def create_run(
 
         from backend.api.audit import log_action
         await log_action(
-            username="admin", user_id=str(current_user.id),
+            username=current_user.ldap_username, user_id=str(current_user.id),
             action="create_run", resource_type="run", resource_id=run_id,
             details={"model_id": model_id, "model_name": _get_model_name(model_id)},
-            db=None,
+            db=db,
         )
 
         return run
@@ -370,19 +402,68 @@ async def list_runs(
     db: AsyncSession = Depends(get_db),
 ):
     """List runs with filtering."""
-    if db is None and settings.is_develop:
-        runs = list(_DEV_RUNS.values())
+    # In dev mode, merge in-memory runs (scheduler + current session) with DB runs (historical)
+    if settings.is_develop:
+        in_memory_runs = list(_DEV_RUNS.values())
         if model_id:
-            runs = [r for r in runs if r["model_id"] == str(model_id)]
+            in_memory_runs = [r for r in in_memory_runs if r["model_id"] == str(model_id)]
         if status_filter:
-            runs = [r for r in runs if r["status"] == status_filter]
+            in_memory_runs = [r for r in in_memory_runs if r["status"] == status_filter]
         if triggered_by:
-            runs = [r for r in runs if r["triggered_by"] == str(triggered_by)]
-        runs.sort(key=lambda r: r.get("created_at", ""), reverse=True)
-        for r in runs:
+            in_memory_runs = [r for r in in_memory_runs if r["triggered_by"] == str(triggered_by)]
+        for r in in_memory_runs:
             r["model_name"] = _get_model_name(r["model_id"])
-            r["username"] = "admin"
-        return runs[offset:offset + limit]
+            if "username" not in r:
+                r["username"] = "admin"
+        in_memory_ids = {r["id"] for r in in_memory_runs}
+
+        # Also fetch DB runs and merge (dedup by ID)
+        db_query = select(Run).order_by(Run.created_at.desc())
+        db_conditions = []
+        if model_id:
+            db_conditions.append(Run.model_id == model_id)
+        if status_filter:
+            db_conditions.append(Run.status == status_filter)
+        if triggered_by:
+            db_conditions.append(Run.triggered_by == triggered_by)
+        if db_conditions:
+            db_query = db_query.where(and_(*db_conditions))
+        db_result = await db.execute(db_query)
+        db_runs = db_result.scalars().all()
+
+        for db_run in db_runs:
+            if str(db_run.id) not in in_memory_ids:
+                run_dict = {
+                    "id": str(db_run.id),
+                    "model_id": str(db_run.model_id),
+                    "triggered_by": str(db_run.triggered_by) if db_run.triggered_by else None,
+                    "status": db_run.status,
+                    "inputs": db_run.inputs,
+                    "config_snapshot": db_run.config_snapshot,
+                    "celery_task_id": db_run.celery_task_id,
+                    "current_container_index": db_run.current_container_index,
+                    "queue_position": db_run.queue_position,
+                    "started_at": db_run.started_at.isoformat() if db_run.started_at else None,
+                    "completed_at": db_run.completed_at.isoformat() if db_run.completed_at else None,
+                    "created_at": db_run.created_at.isoformat() if db_run.created_at else None,
+                    "is_archived": db_run.is_archived,
+                    "archived_at": db_run.archived_at.isoformat() if db_run.archived_at else None,
+                    "archive_path": db_run.archive_path,
+                    "output_path": db_run.output_path,
+                    "log_path": db_run.log_path,
+                }
+                # Resolve model name + username
+                model_result = await db.execute(select(Model.name).where(Model.id == db_run.model_id))
+                run_dict["model_name"] = model_result.scalar_one_or_none() or "Unknown"
+                if db_run.triggered_by:
+                    user_result = await db.execute(select(User.ldap_username).where(User.id == db_run.triggered_by))
+                    run_dict["username"] = user_result.scalar_one_or_none() or "Unknown"
+                else:
+                    run_dict["username"] = "Unknown"
+                in_memory_runs.append(run_dict)
+
+        in_memory_runs.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+        return in_memory_runs[offset:offset + limit]
 
     query = select(Run).order_by(Run.created_at.desc())
     conditions = []
@@ -420,7 +501,7 @@ async def get_run(
     db: AsyncSession = Depends(get_db),
 ):
     """Get a single run."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         run = _DEV_RUNS.get(str(run_id))
         if not run:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
@@ -453,7 +534,7 @@ async def list_run_outputs(
     db: AsyncSession = Depends(get_db),
 ):
     """List output files for a run."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         run = _DEV_RUNS.get(str(run_id))
         if not run:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
@@ -507,7 +588,7 @@ async def download_output_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Download a specific output file."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         run = _DEV_RUNS.get(str(run_id))
         if not run:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
@@ -545,7 +626,7 @@ async def cancel_run(
     db: AsyncSession = Depends(get_db),
 ):
     """Cancel a run."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         run = _DEV_RUNS.get(str(run_id))
         if not run:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")

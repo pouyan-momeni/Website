@@ -49,9 +49,10 @@ export default function ModelRunPage() {
 
     const scheduleMutation = useMutation({
         mutationFn: () => {
-            // Build ISO string directly — avoid new Date() which fails with AM/PM inputs
+            // Convert local date+time to UTC ISO string
             const time24 = scheduledTime || '00:00';
-            const scheduledAt = `${scheduledDate}T${time24}:00`;
+            const localDate = new Date(`${scheduledDate}T${time24}:00`);
+            const scheduledAt = localDate.toISOString();
             return api.createSchedule({
                 model_id: selectedModelId,
                 model_name: model?.name,

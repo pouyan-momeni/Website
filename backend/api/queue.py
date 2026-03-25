@@ -19,7 +19,7 @@ async def get_queue(
     db: AsyncSession = Depends(get_db),
 ):
     """Get the current run queue (queued + running). Runner+ role required."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         from backend.api.runs import _DEV_RUNS, _get_model_name
         active_runs = [
             r for r in _DEV_RUNS.values()
@@ -65,7 +65,7 @@ async def reorder_queue(
     db: AsyncSession = Depends(get_db),
 ):
     """Reorder queued runs. Only affects waiting runs. Runner+ role required."""
-    if db is None and settings.is_develop:
+    if settings.is_develop:
         from backend.api.runs import _DEV_RUNS
         for idx, run_id in enumerate(body.run_ids):
             run = _DEV_RUNS.get(str(run_id))

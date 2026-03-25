@@ -106,7 +106,28 @@ async def list_models(
 ):
     """List all models. Available to all authenticated users."""
     if settings.is_develop:
-        return list(_DEV_MODELS.values())
+        # Merge in-memory defaults with DB models (persisted creates/imports)
+        models = list(_DEV_MODELS.values())
+        in_memory_ids = {m["id"] for m in models}
+        in_memory_slugs = {m["slug"] for m in models}
+        result = await db.execute(select(Model).order_by(Model.name))
+        db_models = result.scalars().all()
+        for db_model in db_models:
+            db_id = str(db_model.id)
+            if db_id not in in_memory_ids and db_model.slug not in in_memory_slugs:
+                models.append({
+                    "id": db_id,
+                    "name": db_model.name,
+                    "slug": db_model.slug,
+                    "description": db_model.description,
+                    "docker_images": db_model.docker_images or [],
+                    "default_config": db_model.default_config or {},
+                    "input_schema": db_model.input_schema or [],
+                    "created_at": db_model.created_at.isoformat() if db_model.created_at else None,
+                    "updated_at": db_model.updated_at.isoformat() if db_model.updated_at else None,
+                })
+        models.sort(key=lambda m: m.get("name", ""))
+        return models
     result = await db.execute(select(Model).order_by(Model.name))
     return result.scalars().all()
 
@@ -122,7 +143,7 @@ async def get_model(
         model_data = _DEV_MODELS.get(str(model_id))
         if model_data:
             return model_data
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+        # Fall through to DB for persisted models
     result = await db.execute(select(Model).where(Model.id == model_id))
     model = result.scalar_one_or_none()
     if not model:
@@ -146,6 +167,13 @@ async def create_model(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"Model with slug '{body.slug}' already exists",
                 )
+        # Also check DB for existing slug
+        existing_db = await db.execute(select(Model).where(Model.slug == body.slug))
+        if existing_db.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Model with slug '{body.slug}' already exists",
+            )
         model_id = str(uuid_mod.uuid4())
         now = datetime.now(timezone.utc).isoformat()
         model_data = {
@@ -160,6 +188,28 @@ async def create_model(
             "updated_at": now,
         }
         _DEV_MODELS[model_id] = model_data
+        # Also persist to DB
+        db_model = Model(
+            id=uuid_mod.UUID(model_id),
+            name=body.name,
+            slug=body.slug,
+            description=body.description,
+            docker_images=[img.model_dump() for img in body.docker_images],
+            default_config={k: v.model_dump() for k, v in body.default_config.items()},
+            input_schema=[inp.model_dump() for inp in body.input_schema],
+        )
+        db.add(db_model)
+        await db.flush()
+
+        from backend.api.audit import log_action
+        await log_action(
+            username=current_user.ldap_username,
+            user_id=str(current_user.id),
+            action="create_model", resource_type="model", resource_id=model_id,
+            details={"model_name": body.name, "slug": body.slug},
+            db=db,
+        )
+
         return model_data
 
     # Production: write to DB
@@ -262,22 +312,70 @@ async def import_model(
                 "input_schema": [inp.model_dump() for inp in body.input_schema],
                 "updated_at": now,
             })
+            # Also update in DB if it exists there
+            db_result = await db.execute(select(Model).where(Model.slug == body.slug))
+            db_model = db_result.scalar_one_or_none()
+            if db_model:
+                db_model.name = body.name
+                db_model.description = body.description
+                db_model.docker_images = [img.model_dump() for img in body.docker_images]
+                db_model.default_config = {k: v.model_dump() for k, v in body.default_config.items()}
+                db_model.input_schema = [inp.model_dump() for inp in body.input_schema]
+                await db.flush()
             return _DEV_MODELS[existing_id]
         else:
-            model_id = str(uuid_mod.uuid4())
-            model_data = {
-                "id": model_id,
-                "name": body.name,
-                "slug": body.slug,
-                "description": body.description,
-                "docker_images": [img.model_dump() for img in body.docker_images],
-                "default_config": {k: v.model_dump() for k, v in body.default_config.items()},
-                "input_schema": [inp.model_dump() for inp in body.input_schema],
-                "created_at": now,
-                "updated_at": now,
-            }
-            _DEV_MODELS[model_id] = model_data
-            return model_data
+            # Check DB for existing slug
+            db_result = await db.execute(select(Model).where(Model.slug == body.slug))
+            db_model = db_result.scalar_one_or_none()
+            if db_model:
+                # Update existing DB model
+                db_model.name = body.name
+                db_model.description = body.description
+                db_model.docker_images = [img.model_dump() for img in body.docker_images]
+                db_model.default_config = {k: v.model_dump() for k, v in body.default_config.items()}
+                db_model.input_schema = [inp.model_dump() for inp in body.input_schema]
+                await db.flush()
+                # Also add to in-memory
+                model_data = {
+                    "id": str(db_model.id),
+                    "name": body.name,
+                    "slug": body.slug,
+                    "description": body.description,
+                    "docker_images": [img.model_dump() for img in body.docker_images],
+                    "default_config": {k: v.model_dump() for k, v in body.default_config.items()},
+                    "input_schema": [inp.model_dump() for inp in body.input_schema],
+                    "created_at": db_model.created_at.isoformat() if db_model.created_at else now,
+                    "updated_at": now,
+                }
+                _DEV_MODELS[str(db_model.id)] = model_data
+                return model_data
+            else:
+                # Create new in both memory and DB
+                model_id = str(uuid_mod.uuid4())
+                model_data = {
+                    "id": model_id,
+                    "name": body.name,
+                    "slug": body.slug,
+                    "description": body.description,
+                    "docker_images": [img.model_dump() for img in body.docker_images],
+                    "default_config": {k: v.model_dump() for k, v in body.default_config.items()},
+                    "input_schema": [inp.model_dump() for inp in body.input_schema],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                _DEV_MODELS[model_id] = model_data
+                db_new = Model(
+                    id=uuid_mod.UUID(model_id),
+                    name=body.name,
+                    slug=body.slug,
+                    description=body.description,
+                    docker_images=[img.model_dump() for img in body.docker_images],
+                    default_config={k: v.model_dump() for k, v in body.default_config.items()},
+                    input_schema=[inp.model_dump() for inp in body.input_schema],
+                )
+                db.add(db_new)
+                await db.flush()
+                return model_data
 
     # Production: upsert by slug
     result = await db.execute(select(Model).where(Model.slug == body.slug))
@@ -416,7 +514,15 @@ async def delete_model(
     """Delete a model. Admin only, develop mode only."""
     if settings.is_develop:
         model_data = _DEV_MODELS.pop(str(model_id), None)
-        if not model_data:
+        model_name = model_data["name"] if model_data else None
+        # Also delete from DB if it exists there
+        db_result = await db.execute(select(Model).where(Model.id == model_id))
+        db_model = db_result.scalar_one_or_none()
+        if db_model:
+            model_name = model_name or db_model.name
+            await db.delete(db_model)
+            await db.flush()
+        if not model_data and not db_model:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
 
         from backend.api.audit import log_action
@@ -424,10 +530,10 @@ async def delete_model(
             username=getattr(current_user, 'ldap_username', 'admin'),
             user_id=str(getattr(current_user, 'id', '')),
             action="delete_model", resource_type="model", resource_id=str(model_id),
-            details={"model_name": model_data["name"]},
-            db=None,
+            details={"model_name": model_name},
+            db=db,
         )
-        return {"detail": f"Model '{model_data['name']}' deleted"}
+        return {"detail": f"Model '{model_name}' deleted"}
 
     result = await db.execute(select(Model).where(Model.id == model_id))
     model = result.scalar_one_or_none()
