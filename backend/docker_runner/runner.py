@@ -3,6 +3,8 @@
 import logging
 import re
 import shlex
+import threading
+import time as _time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -25,6 +27,9 @@ class ContainerResult:
     exit_code: int
     log: str
     docker_container_id: str
+    max_cpu_percent: float = 0.0
+    max_memory_mb: float = 0.0
+    duration_seconds: float = 0.0
 
 
 @dataclass
@@ -58,13 +63,7 @@ class DockerRunner:
             )
 
     def _substitute_variables(self, text: str, run_inputs: dict) -> str:
-        """Replace $variable references in text with values from run_inputs.
-
-        Supports:
-            $variable_name  → replaced with run_inputs["variable_name"]
-            ${variable_name} → same, explicit delimiters
-        Unmatched variables are left as-is.
-        """
+        """Replace $variable references in text with values from run_inputs."""
         if not run_inputs:
             return text
 
@@ -72,9 +71,8 @@ class DockerRunner:
             var_name = m.group(1) or m.group(2)
             if var_name in run_inputs:
                 return str(run_inputs[var_name])
-            return m.group(0)  # leave unmatched as-is
+            return m.group(0)
 
-        # Match ${name} or $name (word characters only)
         return re.sub(r'\$\{(\w+)\}|\$(\w+)', replace_match, text)
 
     def _parse_extra_args(self, extra_args: str, run_inputs: dict = None) -> dict:
@@ -159,13 +157,11 @@ class DockerRunner:
                         lk, lv = args[i].split("=", 1)
                         labels[lk] = lv
                 elif arg in ("--rm", "--name"):
-                    # Skip --rm (we handle cleanup) and --name (we set our own)
                     if arg == "--name" and i + 1 < len(args):
-                        i += 1  # skip the name value too
+                        i += 1
                 else:
                     logger.warning("Unrecognized docker run arg: %s", arg)
             else:
-                # Non-flag argument: this starts the command
                 command_parts = args[i:]
                 break
             i += 1
@@ -182,6 +178,35 @@ class DockerRunner:
         result.update(kwargs)
         return result
 
+    def _poll_container_stats(self, container, stop_event: threading.Event, stats_out: dict):
+        """Background thread that polls container stats and tracks peaks."""
+        max_cpu = 0.0
+        max_mem = 0.0
+        while not stop_event.is_set():
+            try:
+                raw = container.stats(stream=False)
+                # CPU
+                cpu_delta = raw.get("cpu_stats", {}).get("cpu_usage", {}).get("total_usage", 0) - \
+                            raw.get("precpu_stats", {}).get("cpu_usage", {}).get("total_usage", 0)
+                sys_delta = raw.get("cpu_stats", {}).get("system_cpu_usage", 0) - \
+                            raw.get("precpu_stats", {}).get("system_cpu_usage", 0)
+                ncpus = raw.get("cpu_stats", {}).get("online_cpus", 1) or 1
+                if sys_delta > 0 and cpu_delta > 0:
+                    cpu_pct = round((cpu_delta / sys_delta) * ncpus * 100.0, 2)
+                    if cpu_pct > max_cpu:
+                        max_cpu = cpu_pct
+                # Memory
+                mem_bytes = raw.get("memory_stats", {}).get("usage", 0)
+                if mem_bytes:
+                    mem_mb = round(mem_bytes / (1024 * 1024), 2)
+                    if mem_mb > max_mem:
+                        max_mem = mem_mb
+            except Exception:
+                pass  # container may have stopped
+            stop_event.wait(2)  # poll every 2 seconds
+        stats_out["max_cpu_percent"] = max_cpu
+        stats_out["max_memory_mb"] = max_mem
+
     def run_container(
         self,
         image: str,
@@ -193,35 +218,18 @@ class DockerRunner:
     ) -> ContainerResult:
         """
         Run a Docker container synchronously, streaming logs to Redis pub/sub.
-
-        Args:
-            image: Docker image name:tag.
-            volumes: Volume mount dict, e.g. {'/host/path': {'bind': '/container/path', 'mode': 'rw'}}.
-            extra_args: Raw docker run arguments string (supports $variable substitution).
-            run_id: UUID of the run (used for labeling and log channel).
-            container_name: Human-readable name for the container step.
-            run_inputs: Dict of model run inputs for $variable substitution.
-
-        Returns:
-            ContainerResult with exit code, full log text, and container ID.
-
-        Raises:
-            ImageNotFoundError: if the image doesn't exist locally.
+        Collects peak resource usage (CPU%, memory MB) via a background polling thread.
         """
         self._validate_image_exists(image)
 
-        # Parse extra_args into Docker SDK kwargs (with variable substitution)
         parsed = self._parse_extra_args(extra_args, run_inputs=run_inputs)
 
-        # Merge volumes: extra_args volumes override/extend base volumes
         merged_volumes = dict(volumes)
         if "volumes" in parsed:
             merged_volumes.update(parsed.pop("volumes"))
 
-        # Build environment from extra_args
         environment = parsed.pop("environment", {})
 
-        # Build labels: always include our app label + run metadata
         labels = {
             "app": "almplatform",
             "run_id": run_id,
@@ -230,7 +238,6 @@ class DockerRunner:
         if "labels" in parsed:
             labels.update(parsed.pop("labels"))
 
-        # Extract command if present
         command = parsed.pop("command", None)
 
         log_channel = f"run:{run_id}:logs"
@@ -253,20 +260,28 @@ class DockerRunner:
         docker_container_id = container.id
         full_log_lines: list[str] = []
 
+        # Start resource stats polling thread
+        start_time = _time.time()
+        stop_event = threading.Event()
+        stats_out: dict = {"max_cpu_percent": 0.0, "max_memory_mb": 0.0}
+        stats_thread = threading.Thread(
+            target=self._poll_container_stats,
+            args=(container, stop_event, stats_out),
+            daemon=True,
+        )
+        stats_thread.start()
+
         try:
-            # Stream logs in real time
             for log_chunk in container.logs(stream=True, follow=True, timestamps=True):
                 line = log_chunk.decode("utf-8", errors="replace").rstrip("\n")
                 full_log_lines.append(line)
 
-                # Publish each log line to Redis channel
                 log_message = f"[{container_name}] {line}"
                 try:
                     self._redis.publish(log_channel, log_message)
                 except Exception as redis_exc:
                     logger.warning("Failed to publish log line to Redis: %s", redis_exc)
 
-            # Wait for container to fully stop and get exit code
             result = container.wait(timeout=None)
             exit_code = result.get("StatusCode", -1)
 
@@ -278,27 +293,34 @@ class DockerRunner:
                 pass
             raise
         finally:
-            # Clean up the container
+            # Stop stats polling
+            stop_event.set()
+            stats_thread.join(timeout=5)
+            # Clean up
             try:
                 container.remove(force=True)
             except Exception as rm_exc:
                 logger.warning("Failed to remove container: %s", rm_exc)
 
+        duration = round(_time.time() - start_time, 2)
         full_log = "\n".join(full_log_lines)
 
-        # Publish completion message
         status_msg = "completed" if exit_code == 0 else f"failed (exit code {exit_code})"
         self._redis.publish(log_channel, f"[{container_name}] Container {status_msg}")
 
         logger.info(
-            "Container '%s' finished with exit code %d for run %s",
-            container_name, exit_code, run_id,
+            "Container '%s' finished with exit code %d for run %s (%.1fs, peak CPU %.1f%%, peak mem %.1f MB)",
+            container_name, exit_code, run_id, duration,
+            stats_out["max_cpu_percent"], stats_out["max_memory_mb"],
         )
 
         return ContainerResult(
             exit_code=exit_code,
             log=full_log,
             docker_container_id=docker_container_id,
+            max_cpu_percent=stats_out["max_cpu_percent"],
+            max_memory_mb=stats_out["max_memory_mb"],
+            duration_seconds=duration,
         )
 
     def get_container_stats(self, docker_container_id: str) -> dict:

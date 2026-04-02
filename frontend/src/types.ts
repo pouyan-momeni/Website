@@ -27,14 +27,24 @@ export interface InputField {
     source?: 'upload' | 'server';
 }
 
+export interface ResourceStats {
+    avg_cpu_percent: number;
+    avg_memory_mb: number;
+    avg_disk_mb: number;
+    avg_duration_seconds: number;
+    sample_count: number;
+}
+
 export interface Model {
     id: string;
     name: string;
     slug: string;
     description: string | null;
+    category: string | null;
     docker_images: DockerImageSpec[];
     default_config: Record<string, ConfigField>;
     input_schema: InputField[];
+    avg_resources?: ResourceStats;
     created_at: string;
     updated_at: string;
 }
@@ -57,6 +67,13 @@ export interface Run {
     archive_path: string | null;
     output_path: string | null;
     log_path: string | null;
+    container_stats?: Record<string, {
+        image: string;
+        max_cpu_percent: number;
+        max_memory_mb: number;
+        max_disk_mb: number;
+        duration_seconds: number;
+    }>;
 }
 
 export interface RunListItem {
@@ -143,6 +160,13 @@ export interface TokenResponse {
     token_type: string;
 }
 
+export interface NotebookResourceStats {
+    avg_cpu_percent: number;
+    avg_memory_mb: number;
+    avg_duration_seconds: number;
+    sample_count: number;
+}
+
 export interface Notebook {
     id: string;
     name: string;
@@ -156,4 +180,5 @@ export interface Notebook {
     updated_at?: string;
     port: number | null;
     url: string | null;
+    avg_resources?: NotebookResourceStats | null;
 }

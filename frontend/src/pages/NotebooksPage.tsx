@@ -4,6 +4,7 @@ import { api } from '../api/client';
 import {
     Loader2, Plus, Play, Pause, Square, Trash2, Code, Search,
     ArrowLeft, ExternalLink, User, Calendar, X, Copy, FolderOpen, Globe, Share2, XCircle,
+    Cpu, HardDrive, Clock,
 } from 'lucide-react';
 import type { Notebook } from '../types';
 import { useAuthStore } from '../stores/auth';
@@ -454,6 +455,20 @@ export default function NotebooksPage() {
                                     <Calendar className="w-3 h-3" /> {formatDate(nb.updated_at || nb.created_at)}
                                 </span>
                             </div>
+                            {/* Avg resource badges */}
+                            {nb.avg_resources && nb.avg_resources.sample_count > 0 && (
+                                <div className="flex items-center gap-2 mt-1.5">
+                                    <span className="inline-flex items-center gap-0.5 text-[9px] text-muted-foreground/70">
+                                        <Cpu className="w-2.5 h-2.5" />{nb.avg_resources.avg_cpu_percent.toFixed(0)}%
+                                    </span>
+                                    <span className="inline-flex items-center gap-0.5 text-[9px] text-muted-foreground/70">
+                                        <HardDrive className="w-2.5 h-2.5" />{nb.avg_resources.avg_memory_mb >= 1024 ? `${(nb.avg_resources.avg_memory_mb / 1024).toFixed(1)}GB` : `${nb.avg_resources.avg_memory_mb.toFixed(0)}MB`}
+                                    </span>
+                                    <span className="inline-flex items-center gap-0.5 text-[9px] text-muted-foreground/70">
+                                        <Clock className="w-2.5 h-2.5" />{nb.avg_resources.avg_duration_seconds >= 60 ? `${(nb.avg_resources.avg_duration_seconds / 60).toFixed(1)}m` : `${nb.avg_resources.avg_duration_seconds.toFixed(0)}s`}
+                                    </span>
+                                </div>
+                            )}
 
                             {/* Actions */}
                             <div className="flex items-center gap-1 mt-3 pt-2 border-t border-border/50" onClick={(e) => e.stopPropagation()}>

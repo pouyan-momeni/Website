@@ -28,6 +28,7 @@ _DEV_MODELS: dict[str, dict] = {
         "name": "Interest Rate Model",
         "slug": "interest-rate-model",
         "description": "Models interest rate scenarios, yield curve shifts, and duration risk across the portfolio.",
+        "category": "Interest Rate",
         "docker_images": [
             {"name": "data-updater", "image": "alm/ir-data-updater:latest", "order": 1, "extra_args": "-e DATA_SOURCE=bloomberg"},
             {"name": "analyze", "image": "alm/ir-analyze:latest", "order": 2, "extra_args": "-e SCENARIOS=1000"},
@@ -52,6 +53,7 @@ _DEV_MODELS: dict[str, dict] = {
         "name": "Credit Risk Model",
         "slug": "credit-risk-model",
         "description": "Evaluates credit exposure, probability of default, and loss-given-default across counterparties.",
+        "category": "Credit Risk",
         "docker_images": [
             {"name": "data-updater", "image": "alm/cr-data-updater:latest", "order": 1, "extra_args": "-e DATA_SOURCE=internal_db"},
             {"name": "analyze", "image": "alm/cr-analyze:latest", "order": 2, "extra_args": "-e PD_MODEL=merton"},
@@ -77,6 +79,7 @@ _DEV_MODELS: dict[str, dict] = {
         "name": "Liquidity Model",
         "slug": "liquidity-model",
         "description": "Assesses liquidity coverage ratio, net stable funding ratio, and cash flow projections under stress.",
+        "category": "Liquidity",
         "docker_images": [
             {"name": "data-updater", "image": "alm/liq-data-updater:latest", "order": 1, "extra_args": "-e DATA_SOURCE=treasury_system"},
             {"name": "analyze", "image": "alm/liq-analyze:latest", "order": 2, "extra_args": "-e PROJECTION_DAYS=90"},
@@ -106,6 +109,7 @@ async def list_models(
 ):
     """List all models. Available to all authenticated users."""
     if settings.is_develop:
+        from backend.api.runs import _get_model_avg_resources
         # Merge in-memory defaults with DB models (persisted creates/imports)
         models = list(_DEV_MODELS.values())
         in_memory_ids = {m["id"] for m in models}
@@ -120,12 +124,16 @@ async def list_models(
                     "name": db_model.name,
                     "slug": db_model.slug,
                     "description": db_model.description,
+                    "category": db_model.category,
                     "docker_images": db_model.docker_images or [],
                     "default_config": db_model.default_config or {},
                     "input_schema": db_model.input_schema or [],
                     "created_at": db_model.created_at.isoformat() if db_model.created_at else None,
                     "updated_at": db_model.updated_at.isoformat() if db_model.updated_at else None,
                 })
+        # Attach avg resource stats to each model
+        for m in models:
+            m["avg_resources"] = _get_model_avg_resources(m["id"])
         models.sort(key=lambda m: m.get("name", ""))
         return models
     result = await db.execute(select(Model).order_by(Model.name))
@@ -149,6 +157,50 @@ async def get_model(
     if not model:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
     return model
+
+
+@router.get("/{model_id}/resource-stats")
+async def get_model_resource_stats(
+    model_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get average resource usage stats for a model based on historical runs."""
+    if settings.is_develop:
+        from backend.api.runs import _get_model_avg_resources
+        stats = _get_model_avg_resources(str(model_id))
+        return stats
+
+    # Production: query RunContainer table for this model's runs
+    from backend.models.run_container import RunContainer
+    from backend.models.run import Run
+    from sqlalchemy import func
+    result = await db.execute(
+        select(
+            func.avg(RunContainer.max_cpu_percent).label("avg_cpu_percent"),
+            func.avg(RunContainer.max_memory_mb).label("avg_memory_mb"),
+            func.avg(RunContainer.max_disk_mb).label("avg_disk_mb"),
+            func.avg(RunContainer.duration_seconds).label("avg_duration_seconds"),
+            func.count(RunContainer.id).label("sample_count"),
+        ).join(Run, Run.id == RunContainer.run_id)
+        .where(Run.model_id == model_id)
+        .where(RunContainer.max_cpu_percent.isnot(None))
+    )
+    row = result.one_or_none()
+    if row and row.sample_count and row.sample_count > 0:
+        return {
+            "avg_cpu_percent": round(float(row.avg_cpu_percent or 0), 2),
+            "avg_memory_mb": round(float(row.avg_memory_mb or 0), 2),
+            "avg_disk_mb": round(float(row.avg_disk_mb or 0), 2),
+            "avg_duration_seconds": round(float(row.avg_duration_seconds or 0), 2),
+            "sample_count": row.sample_count,
+        }
+    return {
+        "avg_cpu_percent": 0, "avg_memory_mb": 0,
+        "avg_disk_mb": 0, "avg_duration_seconds": 0,
+        "sample_count": 0,
+    }
+
 
 
 @router.post("", response_model=ModelResponse, status_code=status.HTTP_201_CREATED)
@@ -181,6 +233,7 @@ async def create_model(
             "name": body.name,
             "slug": body.slug,
             "description": body.description,
+            "category": body.category,
             "docker_images": [img.model_dump() for img in body.docker_images],
             "default_config": {k: v.model_dump() for k, v in body.default_config.items()},
             "input_schema": [inp.model_dump() for inp in body.input_schema],
@@ -194,6 +247,7 @@ async def create_model(
             name=body.name,
             slug=body.slug,
             description=body.description,
+            category=body.category,
             docker_images=[img.model_dump() for img in body.docker_images],
             default_config={k: v.model_dump() for k, v in body.default_config.items()},
             input_schema=[inp.model_dump() for inp in body.input_schema],
@@ -224,6 +278,7 @@ async def create_model(
         name=body.name,
         slug=body.slug,
         description=body.description,
+        category=body.category,
         docker_images=[img.model_dump() for img in body.docker_images],
         default_config={k: v.model_dump() for k, v in body.default_config.items()},
         input_schema=[inp.model_dump() for inp in body.input_schema],
@@ -434,11 +489,11 @@ async def update_config(
     """Update model default config. Admin only, develop mode only."""
     if settings.is_develop:
         model_data = _DEV_MODELS.get(str(model_id))
-        if not model_data:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
-        model_data["default_config"] = body.default_config
-        model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return model_data
+        if model_data:
+            model_data["default_config"] = body.default_config
+            model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            return model_data
+        # Not in memory — fall through to DB
 
     result = await db.execute(select(Model).where(Model.id == model_id))
     model = result.scalar_one_or_none()
@@ -461,11 +516,11 @@ async def update_input_schema(
     """Update model input schema. Admin only, develop mode only."""
     if settings.is_develop:
         model_data = _DEV_MODELS.get(str(model_id))
-        if not model_data:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
-        model_data["input_schema"] = body.input_schema
-        model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return model_data
+        if model_data:
+            model_data["input_schema"] = body.input_schema
+            model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            return model_data
+        # Not in memory — fall through to DB
 
     result = await db.execute(select(Model).where(Model.id == model_id))
     model = result.scalar_one_or_none()
@@ -488,11 +543,11 @@ async def update_containers(
     """Update model container images and order. Admin only, develop mode only."""
     if settings.is_develop:
         model_data = _DEV_MODELS.get(str(model_id))
-        if not model_data:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
-        model_data["docker_images"] = [img.model_dump() for img in body.docker_images]
-        model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        return model_data
+        if model_data:
+            model_data["docker_images"] = [img.model_dump() for img in body.docker_images]
+            model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            return model_data
+        # Not in memory — fall through to DB
 
     result = await db.execute(select(Model).where(Model.id == model_id))
     model = result.scalar_one_or_none()

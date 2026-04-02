@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, Integer, Text, ForeignKey
+from sqlalchemy import Column, Float, Integer, Text, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import TIMESTAMP
 from sqlalchemy.orm import relationship
@@ -18,12 +18,19 @@ class RunContainer(Base):
     run_id = Column(UUID(as_uuid=True), ForeignKey("runs.id"), nullable=False, index=True)
     container_name = Column(Text, nullable=False)
     docker_container_id = Column(Text, nullable=True)
+    image_name = Column(Text, nullable=True)
     status = Column(Text, nullable=False, default="pending")
     retry_count = Column(Integer, default=0, nullable=False)
     started_at = Column(TIMESTAMP(timezone=True), nullable=True)
     completed_at = Column(TIMESTAMP(timezone=True), nullable=True)
     exit_code = Column(Integer, nullable=True)
     log_file = Column(Text, nullable=True)
+
+    # Resource usage stats (peak values observed during execution)
+    max_cpu_percent = Column(Float, nullable=True)
+    max_memory_mb = Column(Float, nullable=True)
+    max_disk_mb = Column(Float, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
 
     # Relationships
     run = relationship("Run", back_populates="containers")

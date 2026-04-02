@@ -18,6 +18,7 @@ class Model(Base):
     name = Column(Text, nullable=False)
     slug = Column(Text, unique=True, nullable=False, index=True)
     description = Column(Text, nullable=True)
+    category = Column(Text, nullable=True)
     docker_images = Column(JSONB, nullable=False, default=list)
     default_config = Column(JSONB, nullable=False, default=dict)
     input_schema = Column(JSONB, nullable=False, default=list)

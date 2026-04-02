@@ -31,6 +31,19 @@ if settings.is_develop:
         {"name": "Data Quality Monitor", "desc": "Monitor data feeds for quality issues"},
         {"name": "Liquidity Coverage Ratio", "desc": "Calculate and visualize LCR over time"},
     ]
+    # Sample resource history per notebook index (cpu%, memory_mb, duration_s)
+    _sample_history = [
+        [{"cpu_percent": 18.2, "memory_mb": 210.0, "duration_seconds": 1820.0},
+         {"cpu_percent": 22.5, "memory_mb": 235.0, "duration_seconds": 2100.0}],
+        [{"cpu_percent": 35.1, "memory_mb": 310.0, "duration_seconds": 3600.0},
+         {"cpu_percent": 28.8, "memory_mb": 290.0, "duration_seconds": 3120.0}],
+        [{"cpu_percent": 55.0, "memory_mb": 480.0, "duration_seconds": 5400.0}],
+        [{"cpu_percent": 12.3, "memory_mb": 180.0, "duration_seconds": 900.0},
+         {"cpu_percent": 14.7, "memory_mb": 195.0, "duration_seconds": 1050.0},
+         {"cpu_percent": 11.9, "memory_mb": 175.0, "duration_seconds": 870.0}],
+        [],
+    ]
+
     for username, user_info in DEV_USERS.items():
         for i, nb_data in enumerate(_template_notebooks):
             nb_id = str(uuid.uuid4())
@@ -46,6 +59,8 @@ if settings.is_develop:
                 "updated_at": datetime(2026, 2, 22 + min(i, 2), 14, 30, 0, tzinfo=timezone.utc).isoformat(),
                 "port": None,
                 "url": None,
+                "session_started_at": None,
+                "resource_history": list(_sample_history[i]),
             }
 
     # Shared library notebooks (read-only templates, owned by "system")
@@ -77,6 +92,13 @@ class NotebookCreate(BaseModel):
     description: Optional[str] = None
 
 
+class NotebookAvgResources(BaseModel):
+    avg_cpu_percent: float
+    avg_memory_mb: float
+    avg_duration_seconds: float
+    sample_count: int
+
+
 class NotebookResponse(BaseModel):
     id: str
     name: str
@@ -90,6 +112,31 @@ class NotebookResponse(BaseModel):
     updated_at: Optional[str] = None
     port: Optional[int] = None
     url: Optional[str] = None
+    avg_resources: Optional[NotebookAvgResources] = None
+
+
+def _compute_notebook_avg_resources(nb: dict) -> Optional[dict]:
+    """Return average resource stats from the notebook's session history, or None if no data."""
+    history = nb.get("resource_history", [])
+    if not history:
+        return None
+    cpu_vals = [s["cpu_percent"] for s in history if s.get("cpu_percent")]
+    mem_vals = [s["memory_mb"] for s in history if s.get("memory_mb")]
+    dur_vals = [s["duration_seconds"] for s in history if s.get("duration_seconds")]
+    n = len(history)
+    return {
+        "avg_cpu_percent": round(sum(cpu_vals) / len(cpu_vals), 2) if cpu_vals else 0.0,
+        "avg_memory_mb": round(sum(mem_vals) / len(mem_vals), 2) if mem_vals else 0.0,
+        "avg_duration_seconds": round(sum(dur_vals) / len(dur_vals), 2) if dur_vals else 0.0,
+        "sample_count": n,
+    }
+
+
+def _attach_avg_resources(nb: dict) -> dict:
+    """Return a copy of the notebook dict with avg_resources attached."""
+    result = dict(nb)
+    result["avg_resources"] = _compute_notebook_avg_resources(nb)
+    return result
 
 
 @router.get("", response_model=list[NotebookResponse])
@@ -98,7 +145,7 @@ async def list_notebooks(current_user=Depends(get_current_user)):
     user_id = str(current_user.id)
     notebooks = [nb for nb in _NOTEBOOKS.values() if nb["owner_id"] == user_id and nb.get("folder") == "personal"]
     notebooks.sort(key=lambda nb: nb.get("updated_at", nb["created_at"]), reverse=True)
-    return notebooks
+    return [_attach_avg_resources(nb) for nb in notebooks]
 
 
 @router.get("/shared", response_model=list[NotebookResponse])
@@ -106,7 +153,7 @@ async def list_shared_notebooks(current_user=Depends(get_current_user)):
     """List shared library notebooks (read-only). Available to all authenticated users."""
     notebooks = [nb for nb in _NOTEBOOKS.values() if nb.get("folder") == "shared"]
     notebooks.sort(key=lambda nb: nb.get("updated_at", nb["created_at"]), reverse=True)
-    return notebooks
+    return [_attach_avg_resources(nb) for nb in notebooks]
 
 
 @router.post("", response_model=NotebookResponse, status_code=status.HTTP_201_CREATED)
@@ -126,6 +173,8 @@ async def create_notebook(body: NotebookCreate, current_user=Depends(get_current
         "updated_at": now,
         "port": None,
         "url": None,
+        "session_started_at": None,
+        "resource_history": [],
     }
     _NOTEBOOKS[nb_id] = notebook
     return notebook
@@ -248,11 +297,13 @@ async def start_notebook(notebook_id: str, current_user=Depends(get_current_user
         try:
             from backend.services.marimo_service import marimo_service
             port = marimo_service.launch_for_user(current_user.ldap_username)
+            now_str = datetime.now(timezone.utc).isoformat()
             nb["status"] = "running"
             nb["port"] = port
             # Use a proxy URL that goes through our backend, not directly to the port
             nb["url"] = f"/api/notebooks/{notebook_id}/proxy/"
-            nb["updated_at"] = datetime.now(timezone.utc).isoformat()
+            nb["session_started_at"] = now_str
+            nb["updated_at"] = now_str
 
             from backend.api.audit import log_action
             await log_action(
@@ -275,10 +326,12 @@ async def start_notebook(notebook_id: str, current_user=Depends(get_current_user
     from backend.services.marimo_service import marimo_service
     try:
         port = marimo_service.launch_for_user(current_user.ldap_username)
+        now_str = datetime.now(timezone.utc).isoformat()
         nb["status"] = "running"
         nb["port"] = port
         nb["url"] = f"/api/notebooks/{notebook_id}/proxy/"
-        nb["updated_at"] = datetime.now(timezone.utc).isoformat()
+        nb["session_started_at"] = now_str
+        nb["updated_at"] = now_str
 
         from backend.api.audit import log_action
         await log_action(
@@ -302,10 +355,39 @@ async def stop_notebook(notebook_id: str, current_user=Depends(get_current_user)
     if nb["status"] == "stopped":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Already stopped")
 
+    now = datetime.now(timezone.utc)
+    # Record session resource snapshot before clearing state
+    session_started = nb.get("session_started_at")
+    duration_seconds = None
+    if session_started:
+        try:
+            from datetime import datetime as _dt
+            started = _dt.fromisoformat(session_started)
+            duration_seconds = (now - started).total_seconds()
+        except Exception:
+            pass
+    # Sample live monitoring stats if available
+    cpu_percent = None
+    memory_mb = None
+    try:
+        from backend.services.marimo_service import marimo_service
+        stats = marimo_service.get_process_stats(current_user.ldap_username)
+        cpu_percent = stats.get("cpu_percent")
+        memory_mb = stats.get("memory_mb")
+    except Exception:
+        pass
+    if duration_seconds and duration_seconds > 0:
+        nb.setdefault("resource_history", []).append({
+            "cpu_percent": cpu_percent,
+            "memory_mb": memory_mb,
+            "duration_seconds": round(duration_seconds, 1),
+        })
+
     nb["status"] = "stopped"
     nb["port"] = None
     nb["url"] = None
-    nb["updated_at"] = datetime.now(timezone.utc).isoformat()
+    nb["session_started_at"] = None
+    nb["updated_at"] = now.isoformat()
 
     from backend.api.audit import log_action
     await log_action(

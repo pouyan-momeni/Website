@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     CPU_ALERT_THRESHOLD: float = Field(default=0.90, description="CPU usage alert threshold (0.0–1.0)")
     ALERT_COOLDOWN_MINUTES: int = Field(default=30, description="Minutes between resource alert emails")
 
+    # Smart concurrency — total resource budgets for all concurrent containers
+    MAX_TOTAL_MEMORY_MB: float = Field(default=8192.0, description="Max total memory (MB) for concurrent containers")
+    MAX_TOTAL_CPU_PERCENT: float = Field(default=400.0, description="Max total CPU% for concurrent containers (100 = 1 core)")
+
     # App URL for email links
     APP_BASE_URL: str = Field(default="http://localhost", description="Base URL for generating links in emails")
 

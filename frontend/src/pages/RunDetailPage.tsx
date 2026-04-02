@@ -6,7 +6,7 @@ import { useAuthStore } from '../stores/auth';
 import { formatDate, formatDuration, statusColor, statusBg } from '../lib/utils';
 import {
     Loader2, Archive, ArchiveRestore, Terminal, FileText, Settings, Download,
-    Trash2, ArrowLeft, Ban, FileSpreadsheet, BarChart3, FileJson, Eye, X,
+    Trash2, ArrowLeft, Ban, FileSpreadsheet, BarChart3, FileJson, Eye, X, Cpu,
 } from 'lucide-react';
 
 /** Fetches an image via the authenticated API and renders it using a blob URL */
@@ -40,10 +40,15 @@ export default function RunDetailPage() {
     const queryClient = useQueryClient();
     const { user, accessToken } = useAuthStore();
     const [logs, setLogs] = useState<string[]>([]);
-    const [activeTab, setActiveTab] = useState<'logs' | 'inputs' | 'config' | 'outputs'>('logs');
+    const [activeTab, setActiveTab] = useState<'logs' | 'inputs' | 'config' | 'outputs' | 'resources'>('logs');
     const [viewingChart, setViewingChart] = useState<string | null>(null);
     const logRef = useRef<HTMLDivElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
+    const [logTotal, setLogTotal] = useState(0);
+    const [logOffset, setLogOffset] = useState(0);
+    const [hasMoreLogs, setHasMoreLogs] = useState(false);
+    const [loadingMoreLogs, setLoadingMoreLogs] = useState(false);
+    const LOG_PAGE_SIZE = 200;
 
     const { data: run, isLoading } = useQuery({
         queryKey: ['run', id],
@@ -90,15 +95,48 @@ export default function RunDetailPage() {
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ['run', id] }),
     });
 
-    // Fetch logs
+    // Initial log fetch — loads the first page
     useEffect(() => {
         if (!id) return;
-        api.getRunLogs(id).then(data => {
+        api.getRunLogs(id, 0, LOG_PAGE_SIZE).then(data => {
             if (data.logs?.length > 0) setLogs(data.logs);
+            setLogTotal(data.total ?? data.logs?.length ?? 0);
+            setLogOffset(data.logs?.length ?? 0);
+            setHasMoreLogs(data.has_more ?? false);
+            // Auto-scroll to bottom on first load
+            setTimeout(() => {
+                if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+            }, 100);
         }).catch(() => { });
     }, [id, run?.status]);
 
-    // WebSocket for live logs
+    // Load earlier logs on demand
+    const loadMoreLogs = async () => {
+        if (!id || loadingMoreLogs || !hasMoreLogs) return;
+        setLoadingMoreLogs(true);
+        try {
+            const data = await api.getRunLogs(id, logOffset, LOG_PAGE_SIZE);
+            if (data.logs?.length > 0) {
+                const prevScrollHeight = logRef.current?.scrollHeight ?? 0;
+                setLogs(prev => [...prev, ...data.logs]);
+                setLogOffset(prev => prev + data.logs.length);
+                setHasMoreLogs(data.has_more ?? false);
+                setLogTotal(data.total ?? 0);
+                // Maintain scroll position after prepending
+                setTimeout(() => {
+                    if (logRef.current) {
+                        const newScrollHeight = logRef.current.scrollHeight;
+                        logRef.current.scrollTop += newScrollHeight - prevScrollHeight;
+                    }
+                }, 50);
+            } else {
+                setHasMoreLogs(false);
+            }
+        } catch (_e) { /* ignore */ }
+        setLoadingMoreLogs(false);
+    };
+
+    // WebSocket for live logs (running/queued runs only)
     useEffect(() => {
         if (!id || !run || (run.status !== 'running' && run.status !== 'queued')) return;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -266,6 +304,7 @@ export default function RunDetailPage() {
                     { key: 'inputs', label: 'Inputs', icon: FileText },
                     { key: 'config', label: 'Config', icon: Settings },
                     { key: 'outputs', label: 'Outputs', icon: Download },
+                    { key: 'resources', label: 'Resources', icon: Cpu },
                 ].map(({ key, label, icon: Icon }) => (
                     <button key={key} onClick={() => setActiveTab(key as any)}
                         className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm transition-all ${activeTab === key ? 'bg-primary/10 text-primary font-medium' : 'text-muted-foreground hover:text-foreground'}`}>
@@ -280,18 +319,36 @@ export default function RunDetailPage() {
             {/* Tab content */}
             <div className="bg-card border border-border rounded-xl overflow-hidden">
                 {activeTab === 'logs' && (
-                    <div ref={logRef} className="log-viewer p-4 max-h-[500px] overflow-y-auto">
-                        {logs.length > 0 ? logs.map((line, i) => (
-                            <div key={i} className={`py-0.5 font-mono text-xs ${line.includes('[system]') ? 'text-blue-400' :
-                                line.toLowerCase().includes('error') ? 'text-red-400' :
-                                    line.includes('Progress:') ? 'text-emerald-400' : 'text-muted-foreground'}`}>
-                                {line}
+                    <div>
+                        {logTotal > 0 && (
+                            <div className="flex items-center justify-between px-4 pt-3 pb-1">
+                                <span className="text-xs text-muted-foreground">
+                                    Showing {logs.length} of {logTotal} log lines
+                                </span>
+                                {hasMoreLogs && (
+                                    <button
+                                        onClick={loadMoreLogs}
+                                        disabled={loadingMoreLogs}
+                                        className="text-xs text-primary hover:text-primary/80 font-medium px-2 py-1 rounded-md border border-primary/20 hover:bg-primary/10 transition-colors disabled:opacity-50"
+                                    >
+                                        {loadingMoreLogs ? 'Loading...' : `Load more (+${Math.min(LOG_PAGE_SIZE, logTotal - logs.length)})`}
+                                    </button>
+                                )}
                             </div>
-                        )) : (
-                            <p className="text-muted-foreground text-sm">
-                                {run.status === 'running' || run.status === 'queued' ? 'Waiting for logs...' : 'No logs available.'}
-                            </p>
                         )}
+                        <div ref={logRef} className="log-viewer p-4 max-h-[500px] overflow-y-auto">
+                            {logs.length > 0 ? logs.map((line, i) => (
+                                <div key={i} className={`py-0.5 font-mono text-xs ${line.includes('[system]') ? 'text-blue-400' :
+                                    line.toLowerCase().includes('error') ? 'text-red-400' :
+                                        line.includes('Progress:') ? 'text-emerald-400' : 'text-muted-foreground'}`}>
+                                    {line}
+                                </div>
+                            )) : (
+                                <p className="text-muted-foreground text-sm">
+                                    {run.status === 'running' || run.status === 'queued' ? 'Waiting for logs...' : 'No logs available.'}
+                                </p>
+                            )}
+                        </div>
                     </div>
                 )}
 
@@ -398,6 +455,69 @@ export default function RunDetailPage() {
                         {(!outputData?.files || outputData.files.length === 0) && (
                             <p className="text-sm text-muted-foreground py-4 text-center">
                                 {run.status === 'completed' ? 'No output files found.' : 'Output files will appear here after the run completes.'}
+                            </p>
+                        )}
+                    </div>
+                )}
+
+                {activeTab === 'resources' && (
+                    <div className="p-4">
+                        <h3 className="text-sm font-medium mb-3">Container Resource Usage</h3>
+                        {run.container_stats && Object.keys(run.container_stats).length > 0 ? (
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-sm">
+                                    <thead>
+                                        <tr className="border-b border-border text-muted-foreground text-left">
+                                            <th className="pb-2 pr-4 font-medium">Container</th>
+                                            <th className="pb-2 pr-4 font-medium">Image</th>
+                                            <th className="pb-2 pr-4 font-medium text-right">Peak CPU%</th>
+                                            <th className="pb-2 pr-4 font-medium text-right">Peak Memory</th>
+                                            <th className="pb-2 pr-4 font-medium text-right">Disk</th>
+                                            <th className="pb-2 font-medium text-right">Duration</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {Object.entries(run.container_stats as Record<string, any>).map(([name, stats]) => (
+                                            <tr key={name} className="border-b border-border/50">
+                                                <td className="py-2 pr-4 font-medium">{name}</td>
+                                                <td className="py-2 pr-4 text-muted-foreground text-xs font-mono">{stats.image || '—'}</td>
+                                                <td className="py-2 pr-4 text-right">
+                                                    <span className="inline-flex items-center gap-1">
+                                                        <Cpu className="w-3 h-3 text-primary/60" />
+                                                        {stats.max_cpu_percent?.toFixed(1) ?? '—'}%
+                                                    </span>
+                                                </td>
+                                                <td className="py-2 pr-4 text-right">
+                                                    {stats.max_memory_mb != null
+                                                        ? stats.max_memory_mb >= 1024
+                                                            ? `${(stats.max_memory_mb / 1024).toFixed(1)} GB`
+                                                            : `${stats.max_memory_mb.toFixed(0)} MB`
+                                                        : '—'}
+                                                </td>
+                                                <td className="py-2 pr-4 text-right">
+                                                    {stats.max_disk_mb != null
+                                                        ? stats.max_disk_mb >= 1024
+                                                            ? `${(stats.max_disk_mb / 1024).toFixed(1)} GB`
+                                                            : `${stats.max_disk_mb.toFixed(0)} MB`
+                                                        : '—'}
+                                                </td>
+                                                <td className="py-2 text-right">
+                                                    {stats.duration_seconds != null
+                                                        ? stats.duration_seconds >= 60
+                                                            ? `${(stats.duration_seconds / 60).toFixed(1)} min`
+                                                            : `${stats.duration_seconds.toFixed(1)} s`
+                                                        : '—'}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        ) : (
+                            <p className="text-sm text-muted-foreground py-4 text-center">
+                                {run.status === 'completed' || run.status === 'failed'
+                                    ? 'No resource usage data available for this run.'
+                                    : 'Resource stats will appear here after the run completes.'}
                             </p>
                         )}
                     </div>

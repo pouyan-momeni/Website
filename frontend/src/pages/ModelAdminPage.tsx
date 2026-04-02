@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/client';
 import { Loader2, Plus, Trash2, Save, GripVertical, Download, Upload, ChevronRight, ChevronLeft, Check, X } from 'lucide-react';
 import type { InputField, DockerImageSpec, Model } from '../types';
+import ModelSelector from '../components/ModelSelector';
 
 /* ────── Wizard Step Component ────── */
 function WizardStep({ step, label, current }: { step: number; label: string; current: number }) {
@@ -32,7 +33,7 @@ export default function ModelAdminPage() {
     const [showWizard, setShowWizard] = useState(false);
     const [wizardStep, setWizardStep] = useState(1);
     const [wizardData, setWizardData] = useState({
-        name: '', slug: '', description: '',
+        name: '', slug: '', description: '', category: '',
         input_schema: [] as InputField[],
         default_config: {} as Record<string, { value: unknown; type: string; description: string }>,
         docker_images: [] as DockerImageSpec[],
@@ -172,7 +173,7 @@ export default function ModelAdminPage() {
             queryClient.invalidateQueries({ queryKey: ['models'] });
             setShowWizard(false);
             setWizardStep(1);
-            setWizardData({ name: '', slug: '', description: '', input_schema: [], default_config: {}, docker_images: [] });
+            setWizardData({ name: '', slug: '', description: '', category: '', input_schema: [], default_config: {}, docker_images: [] });
             setWizardConfigEntries([]);
         },
     });
@@ -331,6 +332,10 @@ export default function ModelAdminPage() {
                                 <label className="block text-sm font-medium mb-1">Description</label>
                                 <textarea value={wizardData.description} onChange={e => setWizardData(d => ({ ...d, description: e.target.value }))} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm resize-y" rows={3} placeholder="What does this model do?" />
                             </div>
+                            <div>
+                                <label className="block text-sm font-medium mb-1">Category</label>
+                                <input value={wizardData.category} onChange={e => setWizardData(d => ({ ...d, category: e.target.value }))} className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm" placeholder="e.g. Interest Rate, Credit Risk, Liquidity" />
+                            </div>
                         </div>
                     )}
 
@@ -463,16 +468,11 @@ export default function ModelAdminPage() {
             ) : (
                 <>
                     <div className="mb-6">
-                        <label className="block text-sm font-medium mb-1.5">Select Model</label>
-                        <select
-                            value={selectedModelId}
-                            onChange={(e) => handleModelChange(e.target.value)}
-                            className="w-full px-3 py-2.5 bg-card border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                        >
-                            {models.map(m => (
-                                <option key={m.id} value={m.id}>{m.name}</option>
-                            ))}
-                        </select>
+                        <ModelSelector
+                            models={models}
+                            selectedId={selectedModelId}
+                            onChange={handleModelChange}
+                        />
                     </div>
 
                     {model && (

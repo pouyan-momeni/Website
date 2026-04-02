@@ -34,7 +34,73 @@ router = APIRouter(prefix="/api/runs", tags=["runs"])
 _DEV_RUNS: dict[str, dict] = {}
 _DEV_LOGS: dict[str, list[str]] = {}
 _ACTIVE_RUN_IDS: set[str] = set()  # Tracks runs that have simulation threads
-MAX_CONCURRENT_RUNS = 1  # Only 1 run can execute simultaneously; others wait in queue
+
+import logging as _logging
+_run_logger = _logging.getLogger(__name__)
+
+
+def _save_run_metadata(run: dict):
+    """Persist run metadata to disk so it survives restarts."""
+    try:
+        run_dir = os.path.dirname(run.get("output_path", ""))
+        if not run_dir:
+            run_dir = os.path.join(settings.RUNS_BASE_PATH, run["id"])
+        os.makedirs(run_dir, exist_ok=True)
+        meta_path = os.path.join(run_dir, "run_metadata.json")
+        # Write a serializable copy
+        serializable = {k: v for k, v in run.items() if not k.startswith("_")}
+        with open(meta_path, "w") as f:
+            json.dump(serializable, f, indent=2, default=str)
+    except Exception as exc:
+        _run_logger.warning("Failed to save run metadata for %s: %s", run.get("id"), exc)
+
+
+def _load_logs_from_disk(run_id: str, log_path: str) -> list[str]:
+    """Load log lines from disk log files."""
+    lines = []
+    if not log_path or not os.path.isdir(log_path):
+        return lines
+    try:
+        for fname in sorted(os.listdir(log_path)):
+            if fname.endswith(".log"):
+                fpath = os.path.join(log_path, fname)
+                container_name = fname.replace(".log", "")
+                with open(fpath, "r") as f:
+                    for line in f:
+                        line = line.rstrip("\n")
+                        if line:
+                            lines.append(f"[{container_name}] {line}")
+    except Exception:
+        pass
+    return lines
+
+
+def _load_runs_from_disk():
+    """Scan RUNS_BASE_PATH and ARCHIVE_BASE_PATH for run_metadata.json and load into _DEV_RUNS."""
+    loaded = 0
+    for base_path in [settings.RUNS_BASE_PATH, settings.ARCHIVE_BASE_PATH]:
+        if not os.path.isdir(base_path):
+            continue
+        # Walk the directory tree looking for run_metadata.json
+        for root, dirs, files in os.walk(base_path):
+            if "run_metadata.json" in files:
+                meta_path = os.path.join(root, "run_metadata.json")
+                try:
+                    with open(meta_path, "r") as f:
+                        run_data = json.load(f)
+                    run_id = run_data.get("id")
+                    if run_id and run_id not in _DEV_RUNS:
+                        _DEV_RUNS[run_id] = run_data
+                        loaded += 1
+                except Exception as exc:
+                    _run_logger.warning("Failed to load run metadata from %s: %s", meta_path, exc)
+    if loaded > 0:
+        _run_logger.info("Loaded %d run(s) from disk", loaded)
+
+
+# Load persisted runs on module import (dev mode)
+if settings.is_develop:
+    _load_runs_from_disk()
 
 
 def _get_model_name(model_id: str, db_session=None) -> str:
@@ -227,6 +293,67 @@ def _generate_sample_outputs(run_id: str, output_path: str, model_name: str):
         }, f, indent=2)
 
 
+def _send_dev_notification(run: dict, event: str) -> None:
+    """Send a completion email for a dev-mode run (called from background thread)."""
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+        SyncSession = sessionmaker(bind=sync_engine)
+        db = SyncSession()
+        try:
+            user = db.execute(
+                select(User).where(User.id == run["triggered_by"])
+            ).scalar_one_or_none()
+            if not user or not user.email:
+                _run_logger.warning("No email for user %s, skipping dev notification", run.get("triggered_by"))
+                return
+
+            model_name = _get_model_name(run["model_id"])
+            duration = ""
+            if run.get("started_at") and run.get("completed_at"):
+                started = datetime.fromisoformat(run["started_at"].replace("Z", "+00:00"))
+                completed = datetime.fromisoformat(run["completed_at"].replace("Z", "+00:00"))
+                delta = completed - started
+                hours, rem = divmod(int(delta.total_seconds()), 3600)
+                mins, secs = divmod(rem, 60)
+                duration = f"{hours}h {mins}m {secs}s"
+
+            subject = f"[ALMPlatform] Run {event}: {model_name}"
+            body = (
+                f"Run ID: {run['id']}\n"
+                f"Model: {model_name}\n"
+                f"Status: {event}\n"
+                f"Duration: {duration or 'N/A'}\n"
+                f"Link: {settings.APP_BASE_URL}/runs/{run['id']}\n"
+            )
+            msg = MIMEText(body)
+            msg["Subject"] = subject
+            msg["From"] = settings.SMTP_FROM
+            msg["To"] = user.email
+
+            with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
+                server.send_message(msg)
+
+            _run_logger.info("Sent '%s' notification for dev run %s to %s", event, run["id"], user.email)
+        finally:
+            db.close()
+            sync_engine.dispose()
+    except Exception as exc:
+        _run_logger.error("Failed to send dev notification for run %s: %s", run.get("id"), exc)
+
+
+def _run_model_and_notify(run_id: str):
+    """Wrapper: run the model then send an email notification on any terminal state."""
+    _run_model(run_id)
+    run = _DEV_RUNS.get(run_id)
+    if run and run.get("status") in ("completed", "failed", "cancelled"):
+        _send_dev_notification(run, run["status"])
+
+
 def _run_model(run_id: str):
     """Background thread to run a model.
 
@@ -261,6 +388,7 @@ def _run_model(run_id: str):
         run["status"] = "cancelled"
         run["completed_at"] = datetime.now(timezone.utc).isoformat()
         logs.append("[system] Run cancelled before start")
+        _save_run_metadata(run)
         _ACTIVE_RUN_IDS.discard(run_id)
         _try_start_next_run()
         return
@@ -269,6 +397,10 @@ def _run_model(run_id: str):
     run["started_at"] = datetime.now(timezone.utc).isoformat()
     run["queue_position"] = None
     logs.append(f"[system] Starting run for {model_name}")
+    _save_run_metadata(run)
+
+    # Initialize container stats tracking
+    run["container_stats"] = {}
 
     if is_test_model:
         # ── Simulated run for test/demo models ──
@@ -277,11 +409,13 @@ def _run_model(run_id: str):
                 run["status"] = "cancelled"
                 run["completed_at"] = datetime.now(timezone.utc).isoformat()
                 logs.append(f"[system] Run cancelled during {container}")
+                _save_run_metadata(run)
                 _ACTIVE_RUN_IDS.discard(run_id)
                 _try_start_next_run()
                 return
 
             run["current_container_index"] = idx
+            container_start = time.time()
             logs.append(f"[{container}] Starting container {idx + 1}/{len(containers)}...")
 
             steps = 5 if container == "data-updater" else 8 if container == "analyze" else 6
@@ -290,6 +424,7 @@ def _run_model(run_id: str):
                     run["status"] = "cancelled"
                     run["completed_at"] = datetime.now(timezone.utc).isoformat()
                     logs.append(f"[system] Run cancelled during {container}")
+                    _save_run_metadata(run)
                     _ACTIVE_RUN_IDS.discard(run_id)
                     _try_start_next_run()
                     return
@@ -297,10 +432,27 @@ def _run_model(run_id: str):
                 logs.append(f"[{container}] Progress: {progress:.0f}%")
                 time.sleep(0.5)
 
-            logs.append(f"[{container}] Container completed successfully")
+            container_duration = round(time.time() - container_start, 2)
+            # Generate simulated resource stats for test models
+            import random
+            sim_cpu = round(random.uniform(15, 95), 2)
+            sim_mem = round(random.uniform(128, 2048), 2)
+            sim_disk = round(random.uniform(10, 500), 2)
+            # Find image name for this container
+            img_name = ""
+            if docker_images and idx < len(docker_images):
+                img_name = docker_images[idx].get("image", "")
+            run["container_stats"][container] = {
+                "image": img_name,
+                "max_cpu_percent": sim_cpu,
+                "max_memory_mb": sim_mem,
+                "max_disk_mb": sim_disk,
+                "duration_seconds": container_duration,
+            }
+            logs.append(f"[{container}] Container completed successfully (CPU: {sim_cpu}%, Mem: {sim_mem}MB, {container_duration}s)")
 
         # Generate sample output files for test models
-        output_path = run.get("output_path", f"/tmp/alm-runs/{run_id}/outputs")
+        output_path = run.get("output_path", os.path.join(settings.RUNS_BASE_PATH, run_id, "outputs"))
         _generate_sample_outputs(run_id, output_path, model_name)
         logs.append(f"[system] Output files generated at {output_path}")
 
@@ -313,12 +465,13 @@ def _run_model(run_id: str):
             logs.append(f"[system] ERROR: Failed to initialize Docker runner: {exc}")
             run["status"] = "failed"
             run["completed_at"] = datetime.now(timezone.utc).isoformat()
+            _save_run_metadata(run)
             _ACTIVE_RUN_IDS.discard(run_id)
             _try_start_next_run()
             return
 
-        output_path = run.get("output_path", f"/tmp/alm-runs/{run_id}/outputs")
-        log_path = run.get("log_path", f"/tmp/alm-runs/{run_id}/logs")
+        output_path = run.get("output_path", os.path.join(settings.RUNS_BASE_PATH, run_id, "outputs"))
+        log_path = run.get("log_path", os.path.join(settings.RUNS_BASE_PATH, run_id, "logs"))
         os.makedirs(output_path, exist_ok=True)
         os.makedirs(log_path, exist_ok=True)
 
@@ -334,6 +487,7 @@ def _run_model(run_id: str):
                 run["status"] = "cancelled"
                 run["completed_at"] = datetime.now(timezone.utc).isoformat()
                 logs.append(f"[system] Run cancelled before {container_name}")
+                _save_run_metadata(run)
                 _ACTIVE_RUN_IDS.discard(run_id)
                 _try_start_next_run()
                 return
@@ -367,20 +521,41 @@ def _run_model(run_id: str):
                 with open(container_log_file, "w") as f:
                     f.write(result.log or "")
 
+                # Calculate disk usage of output path
+                disk_mb = 0.0
+                try:
+                    for dirpath, dirnames, filenames in os.walk(output_path):
+                        for fname in filenames:
+                            disk_mb += os.path.getsize(os.path.join(dirpath, fname))
+                    disk_mb = round(disk_mb / (1024 * 1024), 2)
+                except Exception:
+                    pass
+
+                # Store per-container resource stats
+                run["container_stats"][container_name] = {
+                    "image": image,
+                    "max_cpu_percent": result.max_cpu_percent,
+                    "max_memory_mb": result.max_memory_mb,
+                    "max_disk_mb": disk_mb,
+                    "duration_seconds": result.duration_seconds,
+                }
+
                 if result.exit_code != 0:
                     logs.append(f"[{container_name}] Container FAILED with exit code {result.exit_code}")
                     run["status"] = "failed"
                     run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    _save_run_metadata(run)
                     _ACTIVE_RUN_IDS.discard(run_id)
                     _try_start_next_run()
                     return
 
-                logs.append(f"[{container_name}] Container completed successfully (exit code 0)")
+                logs.append(f"[{container_name}] Container completed (CPU: {result.max_cpu_percent}%, Mem: {result.max_memory_mb}MB, {result.duration_seconds}s)")
 
             except ImageNotFoundError as exc:
                 logs.append(f"[{container_name}] ERROR: {exc}")
                 run["status"] = "failed"
                 run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _save_run_metadata(run)
                 _ACTIVE_RUN_IDS.discard(run_id)
                 _try_start_next_run()
                 return
@@ -388,6 +563,7 @@ def _run_model(run_id: str):
                 logs.append(f"[{container_name}] ERROR: Container execution failed: {exc}")
                 run["status"] = "failed"
                 run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                _save_run_metadata(run)
                 _ACTIVE_RUN_IDS.discard(run_id)
                 _try_start_next_run()
                 return
@@ -405,33 +581,182 @@ def _run_model(run_id: str):
     run["status"] = "completed"
     run["completed_at"] = datetime.now(timezone.utc).isoformat()
     logs.append("[system] Run completed successfully")
+    _save_run_metadata(run)
 
     # Free the slot and try to start the next queued run
     _ACTIVE_RUN_IDS.discard(run_id)
     _try_start_next_run()
 
 
-def _try_start_next_run():
-    """Promote the next queued run to running if under the concurrency limit."""
-    if len(_ACTIVE_RUN_IDS) >= MAX_CONCURRENT_RUNS:
-        return
+# ─── Resource-based smart concurrency ───
 
-    # Find the next queued run by queue_position
+# Default resource estimates for models with no historical data.
+# Set to the full budget so an unknown model occupies all slots — preventing
+# it from running alongside any other container until we have real measurements.
+_DEFAULT_CPU_ESTIMATE = settings.MAX_TOTAL_CPU_PERCENT
+_DEFAULT_MEMORY_ESTIMATE = settings.MAX_TOTAL_MEMORY_MB
+
+# Sample historical stats for built-in dev models so the UI shows estimates
+# before any real runs have been executed.  Values reflect:
+#   avg_duration_seconds  = average of (sum of container durations) across past runs
+#   avg_memory_mb         = average of (max container memory) across past runs
+#   avg_cpu_percent       = average of (max container CPU %) across past runs
+_DEV_MODEL_SAMPLE_STATS: dict[str, dict] = {
+    "11111111-1111-1111-1111-111111111111": {  # Interest Rate Model (3 containers)
+        "avg_cpu_percent": 78.5,
+        "avg_memory_mb": 24576.0,   # ~24 GB peak
+        "avg_disk_mb": 420.0,
+        "avg_duration_seconds": 79200.0,  # ~22 h total
+        "sample_count": 3,
+    },
+    "22222222-2222-2222-2222-222222222222": {  # Credit Risk Model
+        "avg_cpu_percent": 92.0,
+        "avg_memory_mb": 32768.0,   # ~32 GB peak
+        "avg_disk_mb": 850.0,
+        "avg_duration_seconds": 108000.0,  # ~30 h total
+        "sample_count": 4,
+    },
+    "33333333-3333-3333-3333-333333333333": {  # Liquidity Model
+        "avg_cpu_percent": 45.2,
+        "avg_memory_mb": 8192.0,    # ~8 GB peak
+        "avg_disk_mb": 200.0,
+        "avg_duration_seconds": 25200.0,  # ~7 h total
+        "sample_count": 2,
+    },
+}
+
+
+def _get_model_avg_resources(model_id: str) -> dict:
+    """Compute average resource usage for a model from historical runs.
+
+    For each completed run, takes the *maximum* value across all its containers
+    for CPU, memory, and disk (representing peak load during that run), and the
+    *sum* of container durations (total wall-clock time). Then averages those
+    per-run figures across all historical runs.
+
+    Falls back to conservative defaults if no data is available.
+    """
+    cpu_vals = []
+    mem_vals = []
+    disk_vals = []
+    dur_vals = []
+
+    for run in _DEV_RUNS.values():
+        if run.get("model_id") != model_id:
+            continue
+        if run.get("status") not in ("completed", "failed"):
+            continue
+        stats = run.get("container_stats", {})
+        if not stats:
+            continue
+        container_list = list(stats.values())
+        run_cpu = max((c.get("max_cpu_percent") or 0 for c in container_list), default=0)
+        run_mem = max((c.get("max_memory_mb") or 0 for c in container_list), default=0)
+        run_disk = max((c.get("max_disk_mb") or 0 for c in container_list), default=0)
+        run_dur = sum(c.get("duration_seconds") or 0 for c in container_list)
+        if run_cpu > 0:
+            cpu_vals.append(run_cpu)
+        if run_mem > 0:
+            mem_vals.append(run_mem)
+        if run_disk > 0:
+            disk_vals.append(run_disk)
+        if run_dur > 0:
+            dur_vals.append(run_dur)
+
+    if cpu_vals:
+        return {
+            "avg_cpu_percent": round(sum(cpu_vals) / len(cpu_vals), 2),
+            "avg_memory_mb": round(sum(mem_vals) / len(mem_vals), 2) if mem_vals else 0.0,
+            "avg_disk_mb": round(sum(disk_vals) / len(disk_vals), 2) if disk_vals else 0.0,
+            "avg_duration_seconds": round(sum(dur_vals) / len(dur_vals), 2) if dur_vals else 0.0,
+            "sample_count": len(cpu_vals),
+        }
+
+    # No real run data — use pre-seeded sample stats for known dev models
+    sample = _DEV_MODEL_SAMPLE_STATS.get(model_id)
+    if sample:
+        return sample
+
+    # Truly unknown model: return conservative budget defaults with sample_count=0
+    # so the UI can distinguish "no data" from "has data".
+    return {
+        "avg_cpu_percent": _DEFAULT_CPU_ESTIMATE,
+        "avg_memory_mb": _DEFAULT_MEMORY_ESTIMATE,
+        "avg_disk_mb": 0.0,
+        "avg_duration_seconds": 0.0,
+        "sample_count": 0,
+    }
+
+
+def _get_current_resource_usage() -> dict:
+    """Sum the estimated resource usage of all currently active runs.
+
+    Each active run contributes one 'container slot' of resources
+    (containers within a run are sequential, so only 1 is active at a time).
+    """
+    total_cpu = 0.0
+    total_mem = 0.0
+
+    for run_id in _ACTIVE_RUN_IDS:
+        run = _DEV_RUNS.get(run_id)
+        if not run:
+            continue
+        model_id = run.get("model_id", "")
+        avg = _get_model_avg_resources(model_id)
+        total_cpu += avg["avg_cpu_percent"]
+        total_mem += avg["avg_memory_mb"]
+
+    return {"total_cpu_percent": total_cpu, "total_memory_mb": total_mem}
+
+
+def _try_start_next_run():
+    """Promote queued runs to running if resources are available.
+
+    Uses historical per-model resource averages to estimate whether the
+    next queued run's container would fit within the configured thresholds.
+    Containers within a run execute sequentially (in order).
+    """
     queued = [r for r in _DEV_RUNS.values() if r["status"] == "queued" and r["id"] not in _ACTIVE_RUN_IDS]
     if not queued:
         return
 
     queued.sort(key=lambda r: r.get("queue_position", 999))
-    next_run = queued[0]
-    run_id = next_run["id"]
 
-    _ACTIVE_RUN_IDS.add(run_id)
+    current = _get_current_resource_usage()
 
-    import logging
-    logging.getLogger(__name__).info("Promoting queued run %s to running (slot available)", run_id[:8])
+    for next_run in queued:
+        run_id = next_run["id"]
+        model_id = next_run.get("model_id", "")
+        next_avg = _get_model_avg_resources(model_id)
 
-    thread = threading.Thread(target=_run_model, args=(run_id,), daemon=True)
-    thread.start()
+        projected_cpu = current["total_cpu_percent"] + next_avg["avg_cpu_percent"]
+        projected_mem = current["total_memory_mb"] + next_avg["avg_memory_mb"]
+
+        fits = (
+            projected_cpu <= settings.MAX_TOTAL_CPU_PERCENT
+            and projected_mem <= settings.MAX_TOTAL_MEMORY_MB
+        )
+
+        if fits:
+            _ACTIVE_RUN_IDS.add(run_id)
+            current["total_cpu_percent"] = projected_cpu
+            current["total_memory_mb"] = projected_mem
+
+            _run_logger.info(
+                "Promoting queued run %s (model: %s) — projected CPU: %.0f%% / %.0f%%, Mem: %.0f MB / %.0f MB",
+                run_id[:8], _get_model_name(model_id),
+                projected_cpu, settings.MAX_TOTAL_CPU_PERCENT,
+                projected_mem, settings.MAX_TOTAL_MEMORY_MB,
+            )
+
+            thread = threading.Thread(target=_run_model_and_notify, args=(run_id,), daemon=True)
+            thread.start()
+        else:
+            _run_logger.debug(
+                "Run %s would exceed thresholds (CPU: %.0f%%, Mem: %.0f MB) — staying queued",
+                run_id[:8], projected_cpu, projected_mem,
+            )
+            break
 
 
 # ─── Run Endpoints ───
@@ -461,8 +786,8 @@ async def create_run(
         queued_runs = [r for r in _DEV_RUNS.values() if r["status"] == "queued"]
         max_pos = max((r.get("queue_position", 0) for r in queued_runs), default=0)
 
-        output_path = f"/tmp/alm-runs/{run_id}/outputs"
-        log_path = f"/tmp/alm-runs/{run_id}/logs"
+        output_path = os.path.join(settings.RUNS_BASE_PATH, run_id, "outputs")
+        log_path = os.path.join(settings.RUNS_BASE_PATH, run_id, "logs")
         os.makedirs(output_path, exist_ok=True)
         os.makedirs(log_path, exist_ok=True)
 
@@ -487,14 +812,26 @@ async def create_run(
         }
         _DEV_RUNS[run_id] = run
         _DEV_LOGS[run_id] = [f"[system] Run {run_id} queued at position {max_pos + 1}"]
+        _save_run_metadata(run)
 
-        # Only start immediately if under the concurrency limit
-        if len(_ACTIVE_RUN_IDS) < MAX_CONCURRENT_RUNS:
+        # Only start immediately if resources are available
+        current = _get_current_resource_usage()
+        next_avg = _get_model_avg_resources(model_id)
+        projected_cpu = current["total_cpu_percent"] + next_avg["avg_cpu_percent"]
+        projected_mem = current["total_memory_mb"] + next_avg["avg_memory_mb"]
+        fits = (
+            projected_cpu <= settings.MAX_TOTAL_CPU_PERCENT
+            and projected_mem <= settings.MAX_TOTAL_MEMORY_MB
+        )
+        if fits:
             _ACTIVE_RUN_IDS.add(run_id)
-            thread = threading.Thread(target=_run_model, args=(run_id,), daemon=True)
+            thread = threading.Thread(target=_run_model_and_notify, args=(run_id,), daemon=True)
             thread.start()
         else:
-            _DEV_LOGS[run_id].append(f"[system] Waiting in queue — {len(_ACTIVE_RUN_IDS)} runs already executing (max {MAX_CONCURRENT_RUNS})")
+            _DEV_LOGS[run_id].append(
+                f"[system] Waiting in queue — projected CPU: {projected_cpu:.0f}% / {settings.MAX_TOTAL_CPU_PERCENT:.0f}%,"
+                f" Mem: {projected_mem:.0f} MB / {settings.MAX_TOTAL_MEMORY_MB:.0f} MB"
+            )
 
         from backend.api.audit import log_action
         await log_action(
@@ -663,14 +1000,25 @@ async def get_run(
 @router.get("/{run_id}/logs")
 async def get_run_logs(
     run_id: UUID,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(200, ge=1, le=5000),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get logs for a run."""
+    """Get logs for a run (paginated). Falls back to disk if not in memory."""
     if settings.is_develop:
         logs = _DEV_LOGS.get(str(run_id), [])
-        return {"logs": logs}
-    return {"logs": []}
+        # If no in-memory logs, try to load from disk
+        if not logs:
+            run = _DEV_RUNS.get(str(run_id))
+            log_path = run.get("log_path", "") if run else ""
+            if not log_path:
+                log_path = os.path.join(settings.RUNS_BASE_PATH, str(run_id), "logs")
+            logs = _load_logs_from_disk(str(run_id), log_path)
+        total = len(logs)
+        page = logs[offset:offset + limit]
+        return {"logs": page, "total": total, "has_more": (offset + limit) < total}
+    return {"logs": [], "total": 0, "has_more": False}
 
 
 @router.get("/{run_id}/outputs")
@@ -685,6 +1033,9 @@ async def list_run_outputs(
         if not run:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
         output_path = run.get("output_path", "")
+        if not output_path or not os.path.isdir(output_path):
+            # Fallback: check RUNS_BASE_PATH
+            output_path = os.path.join(settings.RUNS_BASE_PATH, str(run_id), "outputs")
         if not os.path.isdir(output_path):
             return {"files": []}
         files = []
@@ -819,18 +1170,39 @@ async def archive_run(
             if run["status"] not in ("completed", "failed", "cancelled"):
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Run must be completed/failed/cancelled")
 
-            archive_path = f"/tmp/alm-archives/{current_user.ldap_username}/{str(run_id)}"
+            import shutil
+            model_id_str = run.get("model_id", "")
+            model_config = _get_model_config(model_id_str)
+            # Use slug for folder name; fall back to model_id if not found
+            model_slug = model_config.get("slug", model_id_str) if isinstance(model_config, dict) else model_id_str
+            if not model_slug:
+                model_slug = model_id_str or "unknown"
+            model_name = _get_model_name(model_id_str)
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            archive_path = os.path.join(
+                settings.ARCHIVE_BASE_PATH,
+                current_user.ldap_username,
+                model_slug,
+                date_str,
+                str(run_id),
+            )
             os.makedirs(archive_path, exist_ok=True)
+
+            # Copy run output and log directories into archive
+            source_dir = os.path.join(settings.RUNS_BASE_PATH, str(run_id))
+            if os.path.isdir(source_dir):
+                shutil.copytree(source_dir, archive_path, dirs_exist_ok=True)
 
             run["is_archived"] = True
             run["archived_at"] = datetime.now(timezone.utc).isoformat()
             run["archive_path"] = archive_path
+            _save_run_metadata(run)
 
             from backend.api.audit import log_action
             await log_action(
                 username=current_user.ldap_username, user_id=str(current_user.id),
                 action="archive_run", resource_type="run", resource_id=str(run_id),
-                details={"model_name": run.get("model_name", "")},
+                details={"model_name": model_name},
                 db=db,
             )
             return run
@@ -860,6 +1232,7 @@ async def unarchive_run(
             run["is_archived"] = False
             run["archived_at"] = None
             run["archive_path"] = None
+            _save_run_metadata(run)
 
             from backend.api.audit import log_action
             await log_action(
@@ -895,7 +1268,16 @@ async def delete_run(
     if settings.is_develop:
         run = _DEV_RUNS.get(str(run_id))
         if run:
+            import shutil
             run_name = run.get("model_name", "")
+            # Clean up disk files
+            run_dir = os.path.join(settings.RUNS_BASE_PATH, str(run_id))
+            if os.path.isdir(run_dir):
+                shutil.rmtree(run_dir, ignore_errors=True)
+            archive_path = run.get("archive_path", "")
+            if archive_path and os.path.isdir(archive_path):
+                shutil.rmtree(archive_path, ignore_errors=True)
+
             del _DEV_RUNS[str(run_id)]
             _DEV_LOGS.pop(str(run_id), None)
 

@@ -25,40 +25,39 @@ async def get_containers(
     current_user: User = Depends(require_role(["admin", "developer", "runner"])),
 ):
     """List running Docker containers managed by this app. Runner+ role required."""
-    # Dev mode: simulate containers from running DB runs
+    # Dev mode: derive containers from in-memory active runs (DB is not used in dev mode)
     if settings.is_develop:
-        from sqlalchemy import select, create_engine
-        from sqlalchemy.orm import Session, sessionmaker
-        from backend.models.run import Run
-        from backend.models.model import Model
+        import random
+        from backend.api.runs import _DEV_RUNS, _ACTIVE_RUN_IDS
 
-        sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
-        SyncSessionLocal = sessionmaker(bind=sync_engine)
-        db = SyncSessionLocal()
-        try:
-            running_runs = db.execute(
-                select(Run).where(Run.status == "running")
-            ).scalars().all()
-
-            containers = []
-            for run in running_runs:
-                model = db.execute(select(Model).where(Model.id == run.model_id)).scalar_one_or_none()
-                model_name = model.name if model else "Unknown"
+        from backend.api.runs import _get_model_docker_images
+        containers = []
+        for run_id in list(_ACTIVE_RUN_IDS):
+            run = _DEV_RUNS.get(run_id)
+            if not run or run.get("status") != "running":
+                continue
+            docker_images = _get_model_docker_images(run["model_id"])
+            idx = run.get("current_container_index") or 0
+            if docker_images and idx < len(docker_images):
+                img_spec = docker_images[idx]
+                container_name = img_spec.get("name", f"container-{idx}")
+                image = img_spec.get("image", f"alm/unknown:latest")
+            else:
                 container_names = ["data-updater", "analyze", "backtest"]
-                idx = min(run.current_container_index or 0, len(container_names) - 1)
-                containers.append(ContainerInfo(
-                    docker_id=str(run.id)[:12],
-                    name=f"almplatform-{str(run.id)[:8]}-{container_names[idx]}",
-                    image=f"alm/{container_names[idx]}:latest",
-                    status="running",
-                    run_id=str(run.id),
-                    started_at=run.started_at.isoformat() if run.started_at else None,
-                    memory_usage_mb=round(128 + hash(str(run.id)) % 256, 2),
-                    cpu_percent=round((hash(str(run.id)) % 50) + 5, 1),
-                ))
-            return containers
-        finally:
-            db.close()
+                container_name = container_names[min(idx, len(container_names) - 1)]
+                image = f"alm/{container_name}:latest"
+            rng_seed = hash(run_id + container_name)
+            containers.append(ContainerInfo(
+                docker_id=run_id[:12],
+                name=f"almplatform-{run_id[:8]}-{container_name}",
+                image=image,
+                status="running",
+                run_id=run_id,
+                started_at=run.get("started_at"),
+                memory_usage_mb=round(128 + (rng_seed % 256) + random.uniform(-10, 10), 1),
+                cpu_percent=round(5 + (rng_seed % 50) + random.uniform(-3, 5), 1),
+            ))
+        return containers
 
     runner = DockerRunner()
     containers = runner.list_running_containers()

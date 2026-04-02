@@ -56,14 +56,14 @@ def check_resources() -> dict:
     try:
         cooldown_cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.ALERT_COOLDOWN_MINUTES)
 
-        # Get admin emails
-        admins = db.execute(
-            select(User).where(User.role == "admin", User.is_active == True)  # noqa: E712
+        # Get admin and developer emails
+        recipients = db.execute(
+            select(User).where(User.role.in_(["admin", "developer"]), User.is_active == True)  # noqa: E712
         ).scalars().all()
-        admin_emails = [a.email for a in admins if a.email]
+        admin_emails = [r.email for r in recipients if r.email]
 
         if not admin_emails:
-            logger.debug("No admin emails configured, skipping alert check")
+            logger.debug("No admin/developer emails configured, skipping alert check")
             return {"alerts": [], "cpu": cpu_percent, "memory": memory_percent}
 
         # Check memory threshold

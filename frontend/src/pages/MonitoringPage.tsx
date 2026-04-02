@@ -38,19 +38,19 @@ export default function MonitoringPage() {
     const { data: resources } = useQuery({
         queryKey: ['resources'],
         queryFn: () => api.getResources(),
-        refetchInterval: 10000,
+        refetchInterval: 3000,
     });
 
     const { data: containers, isLoading: containersLoading } = useQuery({
         queryKey: ['containers'],
         queryFn: () => api.getContainers(),
-        refetchInterval: 10000,
+        refetchInterval: 3000,
     });
 
     const { data: notebooks, isLoading: notebooksLoading } = useQuery<NotebookMonitorInfo[]>({
         queryKey: ['monitoring-notebooks'],
         queryFn: () => api.getMonitoringNotebooks(),
-        refetchInterval: 10000,
+        refetchInterval: 3000,
     });
 
     const killMutation = useMutation({
@@ -130,7 +130,7 @@ export default function MonitoringPage() {
             {/* Chart */}
             {history.length > 1 && (
                 <div className="bg-card border border-border rounded-xl p-5 mb-8">
-                    <h2 className="text-sm font-medium text-muted-foreground mb-4">Resource History (polling every 10s)</h2>
+                    <h2 className="text-sm font-medium text-muted-foreground mb-4">Resource History (polling every 3s)</h2>
                     <ResponsiveContainer width="100%" height={200}>
                         <AreaChart data={history}>
                             <CartesianGrid strokeDasharray="3 3" stroke="hsl(217 33% 18%)" />

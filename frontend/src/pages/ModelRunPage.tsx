@@ -2,13 +2,14 @@ import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../api/client';
 import { useAuthStore } from '../stores/auth';
+import ModelSelector from '../components/ModelSelector';
 import {
     Loader2, Play, ChevronDown, ChevronRight, Upload, Clock, Calendar,
-    Repeat, X,
+    Repeat, Cpu, HardDrive, Database, AlertCircle,
 } from 'lucide-react';
 
 export default function ModelRunPage() {
-    const { isDevelop } = useAuthStore();
+    useAuthStore();
     const queryClient = useQueryClient();
     const [selectedModelId, setSelectedModelId] = useState<string>('');
     const [inputs, setInputs] = useState<Record<string, string>>({});
@@ -111,12 +112,24 @@ export default function ModelRunPage() {
     const inputSchema = model?.input_schema || [];
     const defaultConfig = model?.default_config || {};
 
+    const missingRequired = inputSchema
+        .filter((f: any) => f.required && !inputs[f.name]?.trim())
+        .map((f: any) => f.name);
+    const canSubmit = missingRequired.length === 0;
+
     const handleModelChange = (id: string) => {
         setSelectedModelId(id);
         setInputs({});
         setConfigOverride({});
         setConfigOpen(false);
     };
+
+    const fmtDuration = (s: number) => {
+        if (s >= 3600) return `${(s / 3600).toFixed(1)}h`;
+        if (s >= 60) return `${(s / 60).toFixed(0)}m`;
+        return `${s.toFixed(0)}s`;
+    };
+    const fmtMemory = (mb: number) => mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(0)} MB`;
 
 
 
@@ -125,18 +138,45 @@ export default function ModelRunPage() {
             <h1 className="text-2xl font-bold mb-4">Run Model</h1>
 
             {/* Model selector */}
-            <div className="mb-6">
-                <label className="block text-sm font-medium mb-1.5">Select Model</label>
-                <select
-                    value={selectedModelId}
-                    onChange={(e) => handleModelChange(e.target.value)}
-                    className="w-full px-3 py-2.5 bg-card border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                >
-                    {models.map(m => (
-                        <option key={m.id} value={m.id}>{m.name}</option>
-                    ))}
-                </select>
+            <div className="mb-4">
+                <ModelSelector
+                    models={models}
+                    selectedId={selectedModelId}
+                    onChange={handleModelChange}
+                />
             </div>
+
+            {/* Estimated resource usage for selected model */}
+            {model?.avg_resources && model.avg_resources.sample_count > 0 && (
+                <div className="flex items-center gap-4 mb-6 px-4 py-2.5 bg-muted/30 border border-border/50 rounded-lg">
+                    <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-semibold flex-shrink-0">Est. Resources</span>
+                    <div className="flex items-center gap-4 flex-wrap">
+                        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                            <Clock className="w-3.5 h-3.5 text-blue-400" />
+                            <span className="font-medium text-foreground">{fmtDuration(model.avg_resources.avg_duration_seconds)}</span>
+                            <span className="text-muted-foreground/60">duration</span>
+                        </span>
+                        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                            <HardDrive className="w-3.5 h-3.5 text-emerald-400" />
+                            <span className="font-medium text-foreground">{fmtMemory(model.avg_resources.avg_memory_mb)}</span>
+                            <span className="text-muted-foreground/60">peak memory</span>
+                        </span>
+                        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                            <Cpu className="w-3.5 h-3.5 text-amber-400" />
+                            <span className="font-medium text-foreground">{model.avg_resources.avg_cpu_percent.toFixed(0)}%</span>
+                            <span className="text-muted-foreground/60">peak CPU</span>
+                        </span>
+                        {model.avg_resources.avg_disk_mb > 0 && (
+                            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                                <Database className="w-3.5 h-3.5 text-purple-400" />
+                                <span className="font-medium text-foreground">{fmtMemory(model.avg_resources.avg_disk_mb)}</span>
+                                <span className="text-muted-foreground/60">peak disk</span>
+                            </span>
+                        )}
+                        <span className="text-[10px] text-muted-foreground/50 ml-auto">avg of {model.avg_resources.sample_count} run{model.avg_resources.sample_count !== 1 ? 's' : ''}</span>
+                    </div>
+                </div>
+            )}
 
             {model && (
                 <>
@@ -354,7 +394,15 @@ export default function ModelRunPage() {
                             )}
                         </div>
 
-                        {/* Error message */}
+                        {/* Missing required fields warning */}
+                        {missingRequired.length > 0 && (
+                            <div className="flex items-start gap-2 p-3 bg-amber-500/10 border border-amber-500/20 rounded-lg text-sm text-amber-400">
+                                <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                                <span>Required fields missing: <span className="font-medium">{missingRequired.join(', ')}</span></span>
+                            </div>
+                        )}
+
+                        {/* API error message */}
                         {(submitMutation.isError || scheduleMutation.isError) && (
                             <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-sm text-red-400">
                                 {((submitMutation.error || scheduleMutation.error) as Error).message}
@@ -366,7 +414,7 @@ export default function ModelRunPage() {
                             {!scheduleMode ? (
                                 <button
                                     onClick={() => submitMutation.mutate()}
-                                    disabled={submitMutation.isPending}
+                                    disabled={submitMutation.isPending || !canSubmit}
                                     className="flex-1 py-3 bg-primary text-primary-foreground rounded-xl text-sm font-medium hover:bg-primary/90 disabled:opacity-50 transition-all flex items-center justify-center gap-2"
                                 >
                                     {submitMutation.isPending ? (
@@ -379,7 +427,7 @@ export default function ModelRunPage() {
                                 <>
                                     <button
                                         onClick={() => scheduleMutation.mutate()}
-                                        disabled={scheduleMutation.isPending || !scheduledDate || !scheduledTime}
+                                        disabled={scheduleMutation.isPending || !scheduledDate || !scheduledTime || !canSubmit}
                                         className="flex-1 py-3 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-500 disabled:opacity-50 transition-all flex items-center justify-center gap-2"
                                     >
                                         {scheduleMutation.isPending ? (
@@ -390,7 +438,7 @@ export default function ModelRunPage() {
                                     </button>
                                     <button
                                         onClick={() => submitMutation.mutate()}
-                                        disabled={submitMutation.isPending}
+                                        disabled={submitMutation.isPending || !canSubmit}
                                         className="py-3 px-4 bg-card border border-border text-foreground rounded-xl text-sm font-medium hover:bg-accent/50 disabled:opacity-50 transition-all flex items-center gap-2"
                                     >
                                         <Play className="w-4 h-4" /> Run Now

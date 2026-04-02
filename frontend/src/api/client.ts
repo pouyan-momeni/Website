@@ -163,8 +163,8 @@ class ApiClient {
         await this.request(`/runs/${id}/delete`, { method: 'DELETE' });
     }
 
-    async getRunLogs(id: string): Promise<{ logs: string[] }> {
-        return this.request(`/runs/${id}/logs`);
+    async getRunLogs(id: string, offset = 0, limit = 200): Promise<{ logs: string[]; total: number; has_more: boolean }> {
+        return this.request(`/runs/${id}/logs?offset=${offset}&limit=${limit}`);
     }
 
     async unarchiveRun(id: string): Promise<Run> {

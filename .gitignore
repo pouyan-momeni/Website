@@ -72,4 +72,4 @@ frontend/build/
 # ALM Website specific
 /tmp/alm-runs/
 /tmp/alm-archives/
-/data
+data/

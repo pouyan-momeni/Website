@@ -72,9 +72,18 @@ class ModelCreate(BaseModel):
     name: str
     slug: str
     description: Optional[str] = None
+    category: Optional[str] = None
     docker_images: list[DockerImageSpec] = Field(default_factory=list)
     default_config: dict[str, ConfigField] = Field(default_factory=dict)
     input_schema: list[InputField] = Field(default_factory=list)
+
+
+class ResourceStats(BaseModel):
+    avg_cpu_percent: float
+    avg_memory_mb: float
+    avg_disk_mb: float
+    avg_duration_seconds: float
+    sample_count: int
 
 
 class ModelResponse(BaseModel):
@@ -82,9 +91,11 @@ class ModelResponse(BaseModel):
     name: str
     slug: str
     description: Optional[str]
+    category: Optional[str] = None
     docker_images: list[dict[str, Any]]
     default_config: dict[str, Any]
     input_schema: list[dict[str, Any]]
+    avg_resources: Optional[ResourceStats] = None
     created_at: datetime
     updated_at: datetime
 
