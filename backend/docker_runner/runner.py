@@ -215,6 +215,7 @@ class DockerRunner:
         run_id: str,
         container_name: str,
         run_inputs: dict = None,
+        extra_env: dict = None,
     ) -> ContainerResult:
         """
         Run a Docker container synchronously, streaming logs to Redis pub/sub.
@@ -229,6 +230,10 @@ class DockerRunner:
             merged_volumes.update(parsed.pop("volumes"))
 
         environment = parsed.pop("environment", {})
+        # Platform-level env vars (INPUT_FOLDER, OUTPUT_FOLDER, etc.) take precedence
+        # over anything parsed from extra_args so they can't be accidentally overridden.
+        if extra_env:
+            environment.update(extra_env)
 
         labels = {
             "app": "almplatform",

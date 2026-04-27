@@ -41,6 +41,7 @@ services:
       - DATABASE_URL_SYNC=postgresql+psycopg2://${POSTGRES_USER:-almplatform}:${POSTGRES_PASSWORD:-your_secure_password}@db:5432/${POSTGRES_DB:-almplatform}
       - REDIS_URL=redis://redis:6379/0
       - APP_MODE=${APP_MODE:-develop}
+      - PYTHONDONTWRITEBYTECODE=1
     volumes:
       - ./backend:/app/backend
       - ./data:/data
@@ -64,6 +65,7 @@ services:
       - DATABASE_URL_SYNC=postgresql+psycopg2://${POSTGRES_USER:-almplatform}:${POSTGRES_PASSWORD:-your_secure_password}@db:5432/${POSTGRES_DB:-almplatform}
       - REDIS_URL=redis://redis:6379/0
       - APP_MODE=${APP_MODE:-develop}
+      - PYTHONDONTWRITEBYTECODE=1
     volumes:
       - ./backend:/app/backend
       - ./data:/data
@@ -87,6 +89,7 @@ services:
       - DATABASE_URL_SYNC=postgresql+psycopg2://${POSTGRES_USER:-almplatform}:${POSTGRES_PASSWORD:-your_secure_password}@db:5432/${POSTGRES_DB:-almplatform}
       - REDIS_URL=redis://redis:6379/0
       - APP_MODE=${APP_MODE:-develop}
+      - PYTHONDONTWRITEBYTECODE=1
     volumes:
       - ./backend:/app/backend
       - ./data:/data

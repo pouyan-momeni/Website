@@ -73,3 +73,5 @@ frontend/build/
 /tmp/alm-runs/
 /tmp/alm-archives/
 data/
+
+.claude

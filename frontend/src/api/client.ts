@@ -179,6 +179,23 @@ class ApiClient {
         return `/api/runs/${id}/outputs/${encodeURIComponent(filename)}`;
     }
 
+    async uploadTempFile(file: File): Promise<{ temp_path: string; filename: string }> {
+        const token = useAuthStore.getState().accessToken;
+        const formData = new FormData();
+        formData.append('file', file);
+        const response = await fetch(`${BASE_URL}/runs/upload-temp`, {
+            method: 'POST',
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+            credentials: 'include',
+            body: formData,
+        });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: response.statusText }));
+            throw new Error(error.detail || `Upload failed: ${response.status}`);
+        }
+        return response.json();
+    }
+
     // Queue
     async getQueue(): Promise<RunListItem[]> {
         return this.request('/queue');

@@ -7,14 +7,17 @@ import json
 import math
 import os
 import random
+import shutil
 import uuid as uuid_mod
 import threading
 import time
+
+import psutil
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -145,6 +148,26 @@ def _get_model_config(model_id: str) -> dict:
     except Exception:
         pass
     return {}
+
+
+def _get_model_input_schema(model_id: str) -> list[dict]:
+    """Get the input_schema list for a model (from memory or DB)."""
+    from backend.api.models import _DEV_MODELS
+    model = _DEV_MODELS.get(model_id)
+    if model:
+        return list(model.get("input_schema", []))
+    try:
+        from sqlalchemy import create_engine, text
+        sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+        with sync_engine.connect() as conn:
+            result = conn.execute(text("SELECT input_schema FROM models WHERE id = :id"), {"id": model_id})
+            row = result.fetchone()
+            if row and row[0]:
+                return list(row[0])
+        sync_engine.dispose()
+    except Exception:
+        pass
+    return []
 
 
 def _get_model_docker_images(model_id: str) -> list[dict]:
@@ -475,98 +498,168 @@ def _run_model(run_id: str):
         os.makedirs(output_path, exist_ok=True)
         os.makedirs(log_path, exist_ok=True)
 
+        # Resolve the inputs folder (created at run-creation time)
+        inputs_path = run.get("inputs_path", os.path.join(settings.RUNS_BASE_PATH, run_id, "inputs"))
+        os.makedirs(inputs_path, exist_ok=True)
+
         # Get run inputs for variable substitution
         run_inputs = run.get("inputs", {})
 
-        for idx, img_spec in enumerate(docker_images):
-            container_name = img_spec.get("name", f"step-{idx + 1}")
-            image = img_spec.get("image", "")
-            extra_args = img_spec.get("extra_args", "")
-
-            if run.get("_cancelled"):
-                run["status"] = "cancelled"
-                run["completed_at"] = datetime.now(timezone.utc).isoformat()
-                logs.append(f"[system] Run cancelled before {container_name}")
-                _save_run_metadata(run)
-                _ACTIVE_RUN_IDS.discard(run_id)
-                _try_start_next_run()
-                return
-
-            run["current_container_index"] = idx
-            logs.append(f"[{container_name}] Starting container {idx + 1}/{len(docker_images)} (image: {image})...")
-
-            # Build base volume mounts
-            volumes = {
-                output_path: {"bind": "/data/output", "mode": "rw"},
-                log_path: {"bind": "/data/logs", "mode": "rw"},
-            }
-
+        # ── Pre-run: copy input_folder contents into the run inputs folder ───
+        user_input_folder = run_inputs.get("input_folder")
+        if user_input_folder and os.path.isdir(user_input_folder):
+            logs.append(f"[system] Copying input_folder {user_input_folder!r} → inputs/")
             try:
-                result = docker_runner.run_container(
-                    image=image,
-                    volumes=volumes,
-                    extra_args=extra_args,
-                    run_id=run_id,
-                    container_name=container_name,
-                    run_inputs=run_inputs,
-                )
+                for item in os.listdir(user_input_folder):
+                    src = os.path.join(user_input_folder, item)
+                    dst = os.path.join(inputs_path, item)
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(src, dst)
+            except Exception as exc:
+                logs.append(f"[system] WARNING: Could not copy input_folder: {exc}")
 
-                # Stream the container's log into _DEV_LOGS
-                if result.log:
-                    for line in result.log.splitlines():
-                        logs.append(f"[{container_name}] {line}")
+        # ── Platform env vars passed to every container ───────────────────────
+        # INPUT_FOLDER  → container path for the run's inputs folder (read-only)
+        # OUTPUT_FOLDER → container path for the run's outputs folder (read-write)
+        platform_env = {
+            "INPUT_FOLDER": "/data/input",
+            "OUTPUT_FOLDER": "/data/output",
+        }
 
-                # Save container log to file
-                container_log_file = os.path.join(log_path, f"{container_name}.log")
-                with open(container_log_file, "w") as f:
-                    f.write(result.log or "")
+        # Mirror Redis pub/sub into _DEV_LOGS in real-time so the dev-mode
+        # WebSocket (which polls _DEV_LOGS) streams logs live while Docker runs.
+        import redis as _sync_redis
+        _fwd_stop = threading.Event()
 
-                # Calculate disk usage of output path
-                disk_mb = 0.0
-                try:
-                    for dirpath, dirnames, filenames in os.walk(output_path):
-                        for fname in filenames:
-                            disk_mb += os.path.getsize(os.path.join(dirpath, fname))
-                    disk_mb = round(disk_mb / (1024 * 1024), 2)
-                except Exception:
-                    pass
+        def _redis_to_dev_logs():
+            try:
+                _r = _sync_redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+                _ps = _r.pubsub()
+                _ps.subscribe(f"run:{run_id}:logs")
+                while not _fwd_stop.is_set():
+                    msg = _ps.get_message(ignore_subscribe_messages=True, timeout=0.05)
+                    if msg and msg["type"] == "message":
+                        logs.append(msg["data"])
+                _ps.unsubscribe()
+                _ps.close()
+                _r.close()
+            except Exception:
+                pass
 
-                # Store per-container resource stats
-                run["container_stats"][container_name] = {
-                    "image": image,
-                    "max_cpu_percent": result.max_cpu_percent,
-                    "max_memory_mb": result.max_memory_mb,
-                    "max_disk_mb": disk_mb,
-                    "duration_seconds": result.duration_seconds,
+        _fwd_thread = threading.Thread(target=_redis_to_dev_logs, daemon=True)
+        _fwd_thread.start()
+
+        try:
+            for idx, img_spec in enumerate(docker_images):
+                container_name = img_spec.get("name", f"step-{idx + 1}")
+                image = img_spec.get("image", "")
+                extra_args = img_spec.get("extra_args", "")
+
+                if run.get("_cancelled"):
+                    run["status"] = "cancelled"
+                    run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    logs.append(f"[system] Run cancelled before {container_name}")
+                    _save_run_metadata(run)
+                    _ACTIVE_RUN_IDS.discard(run_id)
+                    _try_start_next_run()
+                    return
+
+                run["current_container_index"] = idx
+                logs.append(f"[{container_name}] Starting container {idx + 1}/{len(docker_images)} (image: {image})...")
+
+                # Build base volume mounts (inputs read-only, outputs read-write)
+                volumes = {
+                    inputs_path: {"bind": "/data/input", "mode": "ro"},
+                    output_path: {"bind": "/data/output", "mode": "rw"},
+                    log_path: {"bind": "/data/logs", "mode": "rw"},
                 }
 
-                if result.exit_code != 0:
-                    logs.append(f"[{container_name}] Container FAILED with exit code {result.exit_code}")
+                try:
+                    result = docker_runner.run_container(
+                        image=image,
+                        volumes=volumes,
+                        extra_args=extra_args,
+                        run_id=run_id,
+                        container_name=container_name,
+                        run_inputs=run_inputs,
+                        extra_env=platform_env,
+                    )
+                    # Logs were already forwarded live from Redis → _DEV_LOGS.
+                    # Save the full log to disk for persistence.
+                    container_log_file = os.path.join(log_path, f"{container_name}.log")
+                    with open(container_log_file, "w") as f:
+                        f.write(result.log or "")
+
+                    # Calculate disk usage of output path
+                    disk_mb = 0.0
+                    try:
+                        for dirpath, dirnames, filenames in os.walk(output_path):
+                            for fname in filenames:
+                                disk_mb += os.path.getsize(os.path.join(dirpath, fname))
+                        disk_mb = round(disk_mb / (1024 * 1024), 2)
+                    except Exception:
+                        pass
+
+                    # Store per-container resource stats
+                    run["container_stats"][container_name] = {
+                        "image": image,
+                        "max_cpu_percent": result.max_cpu_percent,
+                        "max_memory_mb": result.max_memory_mb,
+                        "max_disk_mb": disk_mb,
+                        "duration_seconds": result.duration_seconds,
+                    }
+
+                    if result.exit_code != 0:
+                        logs.append(f"[{container_name}] Container FAILED with exit code {result.exit_code}")
+                        run["status"] = "failed"
+                        run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                        _save_run_metadata(run)
+                        _ACTIVE_RUN_IDS.discard(run_id)
+                        _try_start_next_run()
+                        return
+
+                    logs.append(f"[{container_name}] Container completed (CPU: {result.max_cpu_percent}%, Mem: {result.max_memory_mb}MB, {result.duration_seconds}s)")
+
+                except ImageNotFoundError as exc:
+                    logs.append(f"[{container_name}] ERROR: {exc}")
                     run["status"] = "failed"
                     run["completed_at"] = datetime.now(timezone.utc).isoformat()
                     _save_run_metadata(run)
                     _ACTIVE_RUN_IDS.discard(run_id)
                     _try_start_next_run()
                     return
+                except Exception as exc:
+                    logs.append(f"[{container_name}] ERROR: Container execution failed: {exc}")
+                    run["status"] = "failed"
+                    run["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    _save_run_metadata(run)
+                    _ACTIVE_RUN_IDS.discard(run_id)
+                    _try_start_next_run()
+                    return
+        finally:
+            # Allow the forwarder to flush any in-flight messages before stopping
+            time.sleep(0.2)
+            _fwd_stop.set()
+            _fwd_thread.join(timeout=3)
 
-                logs.append(f"[{container_name}] Container completed (CPU: {result.max_cpu_percent}%, Mem: {result.max_memory_mb}MB, {result.duration_seconds}s)")
-
-            except ImageNotFoundError as exc:
-                logs.append(f"[{container_name}] ERROR: {exc}")
-                run["status"] = "failed"
-                run["completed_at"] = datetime.now(timezone.utc).isoformat()
-                _save_run_metadata(run)
-                _ACTIVE_RUN_IDS.discard(run_id)
-                _try_start_next_run()
-                return
+        # ── Post-run: copy outputs to user-specified output_folder ───────────
+        user_output_folder = run_inputs.get("output_folder")
+        if user_output_folder:
+            logs.append(f"[system] Copying outputs/ → {user_output_folder!r}")
+            try:
+                os.makedirs(user_output_folder, exist_ok=True)
+                for item in os.listdir(output_path):
+                    src = os.path.join(output_path, item)
+                    dst = os.path.join(user_output_folder, item)
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(src, dst)
+                logs.append(f"[system] Outputs copied to {user_output_folder!r}")
             except Exception as exc:
-                logs.append(f"[{container_name}] ERROR: Container execution failed: {exc}")
-                run["status"] = "failed"
-                run["completed_at"] = datetime.now(timezone.utc).isoformat()
-                _save_run_metadata(run)
-                _ACTIVE_RUN_IDS.discard(run_id)
-                _try_start_next_run()
-                return
+                logs.append(f"[system] WARNING: Could not copy to output_folder: {exc}")
 
         # List the real output files
         output_files = []
@@ -590,11 +683,17 @@ def _run_model(run_id: str):
 
 # ─── Resource-based smart concurrency ───
 
+# Resolve the memory budget once at startup from the configured percentage of
+# total server RAM (e.g. 0.80 → 80% of physical memory, expressed in MB).
+_TOTAL_MEMORY_BUDGET_MB: float = (
+    psutil.virtual_memory().total / (1024 ** 2) * settings.MAX_TOTAL_MEMORY_PCT
+)
+
 # Default resource estimates for models with no historical data.
 # Set to the full budget so an unknown model occupies all slots — preventing
 # it from running alongside any other container until we have real measurements.
 _DEFAULT_CPU_ESTIMATE = settings.MAX_TOTAL_CPU_PERCENT
-_DEFAULT_MEMORY_ESTIMATE = settings.MAX_TOTAL_MEMORY_MB
+_DEFAULT_MEMORY_ESTIMATE = _TOTAL_MEMORY_BUDGET_MB
 
 # Sample historical stats for built-in dev models so the UI shows estimates
 # before any real runs have been executed.  Values reflect:
@@ -734,7 +833,7 @@ def _try_start_next_run():
 
         fits = (
             projected_cpu <= settings.MAX_TOTAL_CPU_PERCENT
-            and projected_mem <= settings.MAX_TOTAL_MEMORY_MB
+            and projected_mem <= _TOTAL_MEMORY_BUDGET_MB
         )
 
         if fits:
@@ -746,7 +845,7 @@ def _try_start_next_run():
                 "Promoting queued run %s (model: %s) — projected CPU: %.0f%% / %.0f%%, Mem: %.0f MB / %.0f MB",
                 run_id[:8], _get_model_name(model_id),
                 projected_cpu, settings.MAX_TOTAL_CPU_PERCENT,
-                projected_mem, settings.MAX_TOTAL_MEMORY_MB,
+                projected_mem, _TOTAL_MEMORY_BUDGET_MB,
             )
 
             thread = threading.Thread(target=_run_model_and_notify, args=(run_id,), daemon=True)
@@ -760,6 +859,22 @@ def _try_start_next_run():
 
 
 # ─── Run Endpoints ───
+
+@router.post("/upload-temp")
+async def upload_temp_file(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Upload a file to a temporary location. Returns the temp_path to include in run inputs."""
+    temp_dir = os.path.join(settings.RUNS_BASE_PATH, "_temp_uploads", str(uuid_mod.uuid4()))
+    os.makedirs(temp_dir, exist_ok=True)
+    safe_name = os.path.basename(file.filename or "upload")
+    temp_path = os.path.join(temp_dir, safe_name)
+    content = await file.read()
+    with open(temp_path, "wb") as f:
+        f.write(content)
+    return {"temp_path": temp_path, "filename": safe_name}
+
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_run(
@@ -788,15 +903,52 @@ async def create_run(
 
         output_path = os.path.join(settings.RUNS_BASE_PATH, run_id, "outputs")
         log_path = os.path.join(settings.RUNS_BASE_PATH, run_id, "logs")
+        inputs_path = os.path.join(settings.RUNS_BASE_PATH, run_id, "inputs")
         os.makedirs(output_path, exist_ok=True)
         os.makedirs(log_path, exist_ok=True)
+        os.makedirs(inputs_path, exist_ok=True)
+
+        # ── Resolve file-type inputs ──────────────────────────────────────────
+        resolved_inputs = dict(body.inputs)
+        input_schema = _get_model_input_schema(model_id)
+        for field in input_schema:
+            fname = field.get("name", "")
+            ftype = field.get("type", "")
+            fsource = field.get("source", "")
+            value = resolved_inputs.get(fname)
+            if not value or ftype != "file":
+                continue
+            if fsource == "server":
+                # Copy the server-side file/directory into the run's inputs folder
+                dest = os.path.join(inputs_path, os.path.basename(value))
+                try:
+                    if os.path.isdir(value):
+                        shutil.copytree(value, dest, dirs_exist_ok=True)
+                    elif os.path.isfile(value):
+                        shutil.copy2(value, dest)
+                    resolved_inputs[fname] = dest
+                except Exception as exc:
+                    _run_logger.warning("Failed to copy server file %s: %s", value, exc)
+            elif fsource == "upload":
+                # value is a temp_path returned by the upload endpoint — move it here
+                if os.path.isfile(value):
+                    dest = os.path.join(inputs_path, os.path.basename(value))
+                    try:
+                        shutil.move(value, dest)
+                        resolved_inputs[fname] = dest
+                    except Exception as exc:
+                        _run_logger.warning("Failed to move uploaded file %s: %s", value, exc)
+
+        # Write all inputs as JSON for reference
+        with open(os.path.join(inputs_path, "inputs.json"), "w") as _f:
+            json.dump(resolved_inputs, _f, indent=2, default=str)
 
         run = {
             "id": run_id,
             "model_id": model_id,
             "triggered_by": str(current_user.id),
             "status": "queued",
-            "inputs": body.inputs,
+            "inputs": resolved_inputs,
             "config_snapshot": default_config,
             "celery_task_id": None,
             "current_container_index": 0,
@@ -809,6 +961,7 @@ async def create_run(
             "archive_path": None,
             "output_path": output_path,
             "log_path": log_path,
+            "inputs_path": inputs_path,
         }
         _DEV_RUNS[run_id] = run
         _DEV_LOGS[run_id] = [f"[system] Run {run_id} queued at position {max_pos + 1}"]
@@ -821,7 +974,7 @@ async def create_run(
         projected_mem = current["total_memory_mb"] + next_avg["avg_memory_mb"]
         fits = (
             projected_cpu <= settings.MAX_TOTAL_CPU_PERCENT
-            and projected_mem <= settings.MAX_TOTAL_MEMORY_MB
+            and projected_mem <= _TOTAL_MEMORY_BUDGET_MB
         )
         if fits:
             _ACTIVE_RUN_IDS.add(run_id)
@@ -830,7 +983,7 @@ async def create_run(
         else:
             _DEV_LOGS[run_id].append(
                 f"[system] Waiting in queue — projected CPU: {projected_cpu:.0f}% / {settings.MAX_TOTAL_CPU_PERCENT:.0f}%,"
-                f" Mem: {projected_mem:.0f} MB / {settings.MAX_TOTAL_MEMORY_MB:.0f} MB"
+                f" Mem: {projected_mem:.0f} MB / {_TOTAL_MEMORY_BUDGET_MB:.0f} MB"
             )
 
         from backend.api.audit import log_action

@@ -13,9 +13,24 @@ export default function ModelRunPage() {
     const queryClient = useQueryClient();
     const [selectedModelId, setSelectedModelId] = useState<string>('');
     const [inputs, setInputs] = useState<Record<string, string>>({});
+    const [uploadingFields, setUploadingFields] = useState<Record<string, boolean>>({});
+    const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({});
     const [configOverride, setConfigOverride] = useState<Record<string, string>>({});
     const [configOpen, setConfigOpen] = useState(false);
     const [submitted, setSubmitted] = useState(false);
+
+    const handleFileUpload = async (fieldName: string, file: File) => {
+        setUploadingFields(prev => ({ ...prev, [fieldName]: true }));
+        setUploadErrors(prev => ({ ...prev, [fieldName]: '' }));
+        try {
+            const { temp_path } = await api.uploadTempFile(file);
+            setInputs(prev => ({ ...prev, [fieldName]: temp_path }));
+        } catch (err) {
+            setUploadErrors(prev => ({ ...prev, [fieldName]: (err as Error).message }));
+        } finally {
+            setUploadingFields(prev => ({ ...prev, [fieldName]: false }));
+        }
+    };
 
     // Scheduling state
     const [scheduleMode, setScheduleMode] = useState(false);
@@ -115,11 +130,14 @@ export default function ModelRunPage() {
     const missingRequired = inputSchema
         .filter((f: any) => f.required && !inputs[f.name]?.trim())
         .map((f: any) => f.name);
-    const canSubmit = missingRequired.length === 0;
+    const anyUploading = Object.values(uploadingFields).some(Boolean);
+    const canSubmit = missingRequired.length === 0 && !anyUploading;
 
     const handleModelChange = (id: string) => {
         setSelectedModelId(id);
         setInputs({});
+        setUploadingFields({});
+        setUploadErrors({});
         setConfigOverride({});
         setConfigOpen(false);
     };
@@ -197,16 +215,33 @@ export default function ModelRunPage() {
                                                 {field.required && <span className="text-red-400 ml-1">*</span>}
                                             </label>
                                             {field.type === 'file' && field.source === 'upload' ? (
-                                                <div className="flex items-center gap-2">
-                                                    <input
-                                                        type="file"
-                                                        onChange={(e) => {
-                                                            const file = e.target.files?.[0];
-                                                            if (file) setInputs(prev => ({ ...prev, [field.name]: file.name }));
-                                                        }}
-                                                        className="flex-1 text-sm file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-sm file:bg-primary/10 file:text-primary hover:file:bg-primary/20"
-                                                    />
-                                                    <Upload className="w-4 h-4 text-muted-foreground" />
+                                                <div className="space-y-1">
+                                                    <div className="flex items-center gap-2">
+                                                        <input
+                                                            type="file"
+                                                            disabled={uploadingFields[field.name]}
+                                                            onChange={(e) => {
+                                                                const file = e.target.files?.[0];
+                                                                if (file) handleFileUpload(field.name, file);
+                                                            }}
+                                                            className="flex-1 text-sm file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:text-sm file:bg-primary/10 file:text-primary hover:file:bg-primary/20 disabled:opacity-50"
+                                                        />
+                                                        {uploadingFields[field.name]
+                                                            ? <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                                                            : inputs[field.name]
+                                                                ? <Upload className="w-4 h-4 text-emerald-400" />
+                                                                : <Upload className="w-4 h-4 text-muted-foreground" />
+                                                        }
+                                                    </div>
+                                                    {uploadingFields[field.name] && (
+                                                        <p className="text-xs text-primary">Uploading…</p>
+                                                    )}
+                                                    {uploadErrors[field.name] && (
+                                                        <p className="text-xs text-red-400">{uploadErrors[field.name]}</p>
+                                                    )}
+                                                    {inputs[field.name] && !uploadingFields[field.name] && !uploadErrors[field.name] && (
+                                                        <p className="text-xs text-emerald-400">Uploaded: {inputs[field.name].split('/').pop()}</p>
+                                                    )}
                                                 </div>
                                             ) : field.type === 'file' ? (
                                                 <input

@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     ALERT_COOLDOWN_MINUTES: int = Field(default=30, description="Minutes between resource alert emails")
 
     # Smart concurrency — total resource budgets for all concurrent containers
-    MAX_TOTAL_MEMORY_MB: float = Field(default=8192.0, description="Max total memory (MB) for concurrent containers")
+    MAX_TOTAL_MEMORY_PCT: float = Field(default=0.80, description="Max fraction of total server memory for concurrent containers (0.0–1.0)")
     MAX_TOTAL_CPU_PERCENT: float = Field(default=400.0, description="Max total CPU% for concurrent containers (100 = 1 core)")
 
     # App URL for email links

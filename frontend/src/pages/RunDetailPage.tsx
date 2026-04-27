@@ -43,6 +43,7 @@ export default function RunDetailPage() {
     const [activeTab, setActiveTab] = useState<'logs' | 'inputs' | 'config' | 'outputs' | 'resources'>('logs');
     const [viewingChart, setViewingChart] = useState<string | null>(null);
     const logRef = useRef<HTMLDivElement>(null);
+    const logSentinelRef = useRef<HTMLDivElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const [logTotal, setLogTotal] = useState(0);
     const [logOffset, setLogOffset] = useState(0);
@@ -110,31 +111,36 @@ export default function RunDetailPage() {
         }).catch(() => { });
     }, [id, run?.status]);
 
-    // Load earlier logs on demand
+    // Load later logs on demand
     const loadMoreLogs = async () => {
         if (!id || loadingMoreLogs || !hasMoreLogs) return;
         setLoadingMoreLogs(true);
         try {
             const data = await api.getRunLogs(id, logOffset, LOG_PAGE_SIZE);
             if (data.logs?.length > 0) {
-                const prevScrollHeight = logRef.current?.scrollHeight ?? 0;
                 setLogs(prev => [...prev, ...data.logs]);
                 setLogOffset(prev => prev + data.logs.length);
                 setHasMoreLogs(data.has_more ?? false);
                 setLogTotal(data.total ?? 0);
-                // Maintain scroll position after prepending
-                setTimeout(() => {
-                    if (logRef.current) {
-                        const newScrollHeight = logRef.current.scrollHeight;
-                        logRef.current.scrollTop += newScrollHeight - prevScrollHeight;
-                    }
-                }, 50);
             } else {
                 setHasMoreLogs(false);
             }
         } catch (_e) { /* ignore */ }
         setLoadingMoreLogs(false);
     };
+
+    // Infinite scroll: trigger loadMoreLogs when the bottom sentinel enters view
+    useEffect(() => {
+        const sentinel = logSentinelRef.current;
+        if (!sentinel || !hasMoreLogs) return;
+        const observer = new IntersectionObserver(
+            (entries) => { if (entries[0].isIntersecting) loadMoreLogs(); },
+            { root: logRef.current, threshold: 0.1 },
+        );
+        observer.observe(sentinel);
+        return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [hasMoreLogs, logOffset, loadingMoreLogs]);
 
     // WebSocket for live logs (running/queued runs only)
     useEffect(() => {
@@ -321,19 +327,10 @@ export default function RunDetailPage() {
                 {activeTab === 'logs' && (
                     <div>
                         {logTotal > 0 && (
-                            <div className="flex items-center justify-between px-4 pt-3 pb-1">
+                            <div className="px-4 pt-3 pb-1">
                                 <span className="text-xs text-muted-foreground">
                                     Showing {logs.length} of {logTotal} log lines
                                 </span>
-                                {hasMoreLogs && (
-                                    <button
-                                        onClick={loadMoreLogs}
-                                        disabled={loadingMoreLogs}
-                                        className="text-xs text-primary hover:text-primary/80 font-medium px-2 py-1 rounded-md border border-primary/20 hover:bg-primary/10 transition-colors disabled:opacity-50"
-                                    >
-                                        {loadingMoreLogs ? 'Loading...' : `Load more (+${Math.min(LOG_PAGE_SIZE, logTotal - logs.length)})`}
-                                    </button>
-                                )}
                             </div>
                         )}
                         <div ref={logRef} className="log-viewer p-4 max-h-[500px] overflow-y-auto">
@@ -347,6 +344,12 @@ export default function RunDetailPage() {
                                 <p className="text-muted-foreground text-sm">
                                     {run.status === 'running' || run.status === 'queued' ? 'Waiting for logs...' : 'No logs available.'}
                                 </p>
+                            )}
+                            {/* Sentinel — entering viewport triggers loading the next page */}
+                            {hasMoreLogs && (
+                                <div ref={logSentinelRef} className="flex justify-center py-2">
+                                    {loadingMoreLogs && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />}
+                                </div>
                             )}
                         </div>
                     </div>
