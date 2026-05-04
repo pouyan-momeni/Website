@@ -210,11 +210,11 @@ class DockerRunner:
     def run_container(
         self,
         image: str,
-        volumes: dict[str, dict[str, str]],
         extra_args: str,
         run_id: str,
         container_name: str,
         run_inputs: dict = None,
+        volumes: dict[str, dict[str, str]] = None,
         extra_env: dict = None,
     ) -> ContainerResult:
         """
@@ -225,7 +225,7 @@ class DockerRunner:
 
         parsed = self._parse_extra_args(extra_args, run_inputs=run_inputs)
 
-        merged_volumes = dict(volumes)
+        merged_volumes = dict(volumes or {})
         if "volumes" in parsed:
             merged_volumes.update(parsed.pop("volumes"))
 
@@ -247,6 +247,35 @@ class DockerRunner:
 
         log_channel = f"run:{run_id}:logs"
 
+        # Build equivalent `docker run` command for the logs
+        cmd_parts = ["docker run --rm"]
+        cmd_parts.append(f"--name almplatform-{run_id[:8]}-{container_name}")
+        for k, v in environment.items():
+            cmd_parts.append(f"-e {shlex.quote(f'{k}={v}')}")
+        for host_path, mount in merged_volumes.items():
+            bind = mount["bind"]
+            mode = mount.get("mode", "rw")
+            cmd_parts.append(f"-v {shlex.quote(f'{host_path}:{bind}:{mode}')}")
+        for lk, lv in labels.items():
+            cmd_parts.append(f"--label {shlex.quote(f'{lk}={lv}')}")
+        if parsed.get("network"):
+            cmd_parts.append(f"--network {shlex.quote(parsed['network'])}")
+        if parsed.get("mem_limit"):
+            cmd_parts.append(f"--memory {shlex.quote(str(parsed['mem_limit']))}")
+        if parsed.get("nano_cpus"):
+            cmd_parts.append(f"--cpus {parsed['nano_cpus'] / 1e9:.2f}")
+        if parsed.get("working_dir"):
+            cmd_parts.append(f"--workdir {shlex.quote(parsed['working_dir'])}")
+        if parsed.get("entrypoint"):
+            cmd_parts.append(f"--entrypoint {shlex.quote(parsed['entrypoint'])}")
+        if parsed.get("user"):
+            cmd_parts.append(f"--user {shlex.quote(parsed['user'])}")
+        cmd_parts.append(image)
+        if command:
+            cmd_parts.extend(shlex.quote(c) for c in command)
+        docker_cmd_str = " \\\n  ".join(cmd_parts)
+
+        self._redis.publish(log_channel, f"[{container_name}] $ {docker_cmd_str}")
         logger.info("Starting container '%s' (image: %s) for run %s", container_name, image, run_id)
 
         container = self._client.containers.run(

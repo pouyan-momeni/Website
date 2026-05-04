@@ -110,16 +110,26 @@ async def list_models(
     """List all models. Available to all authenticated users."""
     if settings.is_develop:
         from backend.api.runs import _get_model_avg_resources
-        # Merge in-memory defaults with DB models (persisted creates/imports)
-        models = list(_DEV_MODELS.values())
-        in_memory_ids = {m["id"] for m in models}
-        in_memory_slugs = {m["slug"] for m in models}
+        # On first call, refresh in-memory models from DB so that persisted
+        # settings changes survive Docker restarts.
         result = await db.execute(select(Model).order_by(Model.name))
         db_models = result.scalars().all()
         for db_model in db_models:
             db_id = str(db_model.id)
-            if db_id not in in_memory_ids and db_model.slug not in in_memory_slugs:
-                models.append({
+            if db_id in _DEV_MODELS:
+                # DB version has persisted edits — override in-memory defaults
+                _DEV_MODELS[db_id].update({
+                    "name": db_model.name,
+                    "slug": db_model.slug,
+                    "description": db_model.description,
+                    "category": db_model.category,
+                    "docker_images": db_model.docker_images or [],
+                    "default_config": db_model.default_config or {},
+                    "input_schema": db_model.input_schema or [],
+                    "updated_at": db_model.updated_at.isoformat() if db_model.updated_at else None,
+                })
+            elif db_model.slug not in {m["slug"] for m in _DEV_MODELS.values()}:
+                _DEV_MODELS[db_id] = {
                     "id": db_id,
                     "name": db_model.name,
                     "slug": db_model.slug,
@@ -130,7 +140,8 @@ async def list_models(
                     "input_schema": db_model.input_schema or [],
                     "created_at": db_model.created_at.isoformat() if db_model.created_at else None,
                     "updated_at": db_model.updated_at.isoformat() if db_model.updated_at else None,
-                })
+                }
+        models = list(_DEV_MODELS.values())
         # Attach avg resource stats to each model
         for m in models:
             m["avg_resources"] = _get_model_avg_resources(m["id"])
@@ -492,6 +503,24 @@ async def update_config(
         if model_data:
             model_data["default_config"] = body.default_config
             model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            # Also persist to DB
+            db_result = await db.execute(select(Model).where(Model.id == model_id))
+            db_model = db_result.scalar_one_or_none()
+            if db_model:
+                db_model.default_config = body.default_config
+                await db.flush()
+            else:
+                db_model = Model(
+                    id=model_id,
+                    name=model_data["name"], slug=model_data["slug"],
+                    description=model_data.get("description"),
+                    category=model_data.get("category"),
+                    docker_images=model_data.get("docker_images", []),
+                    default_config=body.default_config,
+                    input_schema=model_data.get("input_schema", []),
+                )
+                db.add(db_model)
+                await db.flush()
             return model_data
         # Not in memory — fall through to DB
 
@@ -519,6 +548,24 @@ async def update_input_schema(
         if model_data:
             model_data["input_schema"] = body.input_schema
             model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            # Also persist to DB
+            db_result = await db.execute(select(Model).where(Model.id == model_id))
+            db_model = db_result.scalar_one_or_none()
+            if db_model:
+                db_model.input_schema = body.input_schema
+                await db.flush()
+            else:
+                db_model = Model(
+                    id=model_id,
+                    name=model_data["name"], slug=model_data["slug"],
+                    description=model_data.get("description"),
+                    category=model_data.get("category"),
+                    docker_images=model_data.get("docker_images", []),
+                    default_config=model_data.get("default_config", {}),
+                    input_schema=body.input_schema,
+                )
+                db.add(db_model)
+                await db.flush()
             return model_data
         # Not in memory — fall through to DB
 
@@ -546,6 +593,24 @@ async def update_containers(
         if model_data:
             model_data["docker_images"] = [img.model_dump() for img in body.docker_images]
             model_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+            # Also persist to DB
+            db_result = await db.execute(select(Model).where(Model.id == model_id))
+            db_model = db_result.scalar_one_or_none()
+            if db_model:
+                db_model.docker_images = [img.model_dump() for img in body.docker_images]
+                await db.flush()
+            else:
+                db_model = Model(
+                    id=model_id,
+                    name=model_data["name"], slug=model_data["slug"],
+                    description=model_data.get("description"),
+                    category=model_data.get("category"),
+                    docker_images=[img.model_dump() for img in body.docker_images],
+                    default_config=model_data.get("default_config", {}),
+                    input_schema=model_data.get("input_schema", []),
+                )
+                db.add(db_model)
+                await db.flush()
             return model_data
         # Not in memory — fall through to DB
 

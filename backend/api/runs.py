@@ -505,29 +505,10 @@ def _run_model(run_id: str):
         # Get run inputs for variable substitution
         run_inputs = run.get("inputs", {})
 
-        # ── Pre-run: copy input_folder contents into the run inputs folder ───
-        user_input_folder = run_inputs.get("input_folder")
-        if user_input_folder and isinstance(user_input_folder, str) and os.path.isdir(user_input_folder):
-            logs.append(f"[system] Copying input_folder {user_input_folder!r} → inputs/")
-            try:
-                for item in os.listdir(user_input_folder):
-                    src = os.path.join(user_input_folder, item)
-                    dst = os.path.join(inputs_path, item)
-                    if os.path.isdir(src):
-                        shutil.copytree(src, dst, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(src, dst)
-            except Exception as exc:
-                logs.append(f"[system] WARNING: Could not copy input_folder: {exc}")
-
-        # ── Platform env vars passed to every container ───────────────────────
-        # INPUT_FOLDER  → /data/input (always the run's inputs folder inside the container)
-        # OUTPUT_FOLDER → user-specified path if provided, otherwise /data/output
-        user_output_folder_env = run_inputs.get("output_folder")
-        platform_env = {
-            "INPUT_FOLDER": "/data/input",
-            "OUTPUT_FOLDER": user_output_folder_env if isinstance(user_output_folder_env, str) and user_output_folder_env.strip() else "/data/output",
-        }
+        # Add platform paths so $IF / $OF resolve in extra_args
+        substitution_inputs = dict(run_inputs)
+        substitution_inputs["IF"] = inputs_path
+        substitution_inputs["OF"] = output_path
 
         # Mirror Redis pub/sub into _DEV_LOGS in real-time so the dev-mode
         # WebSocket (which polls _DEV_LOGS) streams logs live while Docker runs.
@@ -570,25 +551,16 @@ def _run_model(run_id: str):
                 run["current_container_index"] = idx
                 logs.append(f"[{container_name}] Starting container {idx + 1}/{len(docker_images)} (image: {image})...")
 
-                # Build base volume mounts (inputs read-only, outputs read-write)
-                volumes = {
-                    inputs_path: {"bind": "/data/input", "mode": "ro"},
-                    output_path: {"bind": "/data/output", "mode": "rw"},
-                    log_path: {"bind": "/data/logs", "mode": "rw"},
-                }
-
                 try:
                     # Store the active container so cancel_run can kill it immediately
                     run["_active_container_image"] = image
                     run["_active_container_name"] = container_name
                     result = docker_runner.run_container(
                         image=image,
-                        volumes=volumes,
                         extra_args=extra_args,
                         run_id=run_id,
                         container_name=container_name,
-                        run_inputs=run_inputs,
-                        extra_env=platform_env,
+                        run_inputs=substitution_inputs,
                     )
                     run.pop("_active_container_image", None)
                     run.pop("_active_container_name", None)
@@ -649,23 +621,6 @@ def _run_model(run_id: str):
             time.sleep(0.2)
             _fwd_stop.set()
             _fwd_thread.join(timeout=3)
-
-        # ── Post-run: copy outputs to user-specified output_folder ───────────
-        user_output_folder = run_inputs.get("output_folder")
-        if isinstance(user_output_folder, str) and user_output_folder.strip():
-            logs.append(f"[system] Copying outputs/ → {user_output_folder!r}")
-            try:
-                os.makedirs(user_output_folder, exist_ok=True)
-                for item in os.listdir(output_path):
-                    src = os.path.join(output_path, item)
-                    dst = os.path.join(user_output_folder, item)
-                    if os.path.isdir(src):
-                        shutil.copytree(src, dst, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(src, dst)
-                logs.append(f"[system] Outputs copied to {user_output_folder!r}")
-            except Exception as exc:
-                logs.append(f"[system] WARNING: Could not copy to output_folder: {exc}")
 
         # List the real output files
         output_files = []
@@ -922,14 +877,10 @@ async def create_run(
             ftype = field.get("type", "")
             fsource = field.get("source", "")
             value = resolved_inputs.get(fname)
-            # input_folder and output_folder are special — handled in _run_model
-            if fname in ("input_folder", "output_folder"):
-                continue
             if not value or ftype != "file":
                 continue
             if fsource == "server":
-                target_path = output_path if fname == "output_folder" else inputs_path
-                dest = os.path.join(target_path, os.path.basename(value))
+                dest = os.path.join(inputs_path, os.path.basename(value))
                 try:
                     if os.path.isdir(value):
                         # Copy the folder itself (not its contents) into the target folder
