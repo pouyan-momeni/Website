@@ -507,7 +507,7 @@ def _run_model(run_id: str):
 
         # ── Pre-run: copy input_folder contents into the run inputs folder ───
         user_input_folder = run_inputs.get("input_folder")
-        if user_input_folder and os.path.isdir(user_input_folder):
+        if user_input_folder and isinstance(user_input_folder, str) and os.path.isdir(user_input_folder):
             logs.append(f"[system] Copying input_folder {user_input_folder!r} → inputs/")
             try:
                 for item in os.listdir(user_input_folder):
@@ -521,11 +521,12 @@ def _run_model(run_id: str):
                 logs.append(f"[system] WARNING: Could not copy input_folder: {exc}")
 
         # ── Platform env vars passed to every container ───────────────────────
-        # INPUT_FOLDER  → container path for the run's inputs folder (read-only)
-        # OUTPUT_FOLDER → container path for the run's outputs folder (read-write)
+        # INPUT_FOLDER  → /data/input (always the run's inputs folder inside the container)
+        # OUTPUT_FOLDER → user-specified path if provided, otherwise /data/output
+        user_output_folder_env = run_inputs.get("output_folder")
         platform_env = {
             "INPUT_FOLDER": "/data/input",
-            "OUTPUT_FOLDER": "/data/output",
+            "OUTPUT_FOLDER": user_output_folder_env if isinstance(user_output_folder_env, str) and user_output_folder_env.strip() else "/data/output",
         }
 
         # Mirror Redis pub/sub into _DEV_LOGS in real-time so the dev-mode
@@ -577,6 +578,9 @@ def _run_model(run_id: str):
                 }
 
                 try:
+                    # Store the active container so cancel_run can kill it immediately
+                    run["_active_container_image"] = image
+                    run["_active_container_name"] = container_name
                     result = docker_runner.run_container(
                         image=image,
                         volumes=volumes,
@@ -586,6 +590,8 @@ def _run_model(run_id: str):
                         run_inputs=run_inputs,
                         extra_env=platform_env,
                     )
+                    run.pop("_active_container_image", None)
+                    run.pop("_active_container_name", None)
                     # Logs were already forwarded live from Redis → _DEV_LOGS.
                     # Save the full log to disk for persistence.
                     container_log_file = os.path.join(log_path, f"{container_name}.log")
@@ -646,7 +652,7 @@ def _run_model(run_id: str):
 
         # ── Post-run: copy outputs to user-specified output_folder ───────────
         user_output_folder = run_inputs.get("output_folder")
-        if user_output_folder:
+        if isinstance(user_output_folder, str) and user_output_folder.strip():
             logs.append(f"[system] Copying outputs/ → {user_output_folder!r}")
             try:
                 os.makedirs(user_output_folder, exist_ok=True)
@@ -916,17 +922,22 @@ async def create_run(
             ftype = field.get("type", "")
             fsource = field.get("source", "")
             value = resolved_inputs.get(fname)
+            # input_folder and output_folder are special — handled in _run_model
+            if fname in ("input_folder", "output_folder"):
+                continue
             if not value or ftype != "file":
                 continue
             if fsource == "server":
-                # Copy the server-side file/directory into the run's inputs folder
-                dest = os.path.join(inputs_path, os.path.basename(value))
+                target_path = output_path if fname == "output_folder" else inputs_path
+                dest = os.path.join(target_path, os.path.basename(value))
                 try:
                     if os.path.isdir(value):
+                        # Copy the folder itself (not its contents) into the target folder
                         shutil.copytree(value, dest, dirs_exist_ok=True)
+                        resolved_inputs[fname] = dest
                     elif os.path.isfile(value):
                         shutil.copy2(value, dest)
-                    resolved_inputs[fname] = dest
+                        resolved_inputs[fname] = dest
                 except Exception as exc:
                     _run_logger.warning("Failed to copy server file %s: %s", value, exc)
             elif fsource == "upload":
@@ -1287,6 +1298,23 @@ async def cancel_run(
             run["status"] = "cancelled"
             run["completed_at"] = datetime.now(timezone.utc).isoformat()
             _DEV_LOGS.setdefault(str(run_id), []).append("[system] Run cancelled while queued")
+        elif run.get("_active_container_name"):
+            # Kill the running Docker container immediately
+            container_name = run["_active_container_name"]
+            try:
+                from backend.docker_runner.runner import DockerRunner
+                import docker as _docker
+                _client = _docker.from_env()
+                full_name = f"almplatform-{str(run_id)[:8]}-{container_name}"
+                try:
+                    _c = _client.containers.get(full_name)
+                    _c.kill()
+                    _run_logger.info("Killed container %s for cancelled run %s", full_name, run_id)
+                    _DEV_LOGS.setdefault(str(run_id), []).append(f"[system] Container {container_name} killed")
+                except Exception as kill_exc:
+                    _run_logger.warning("Could not kill container %s: %s", full_name, kill_exc)
+            except Exception as exc:
+                _run_logger.warning("Cancel kill failed for run %s: %s", run_id, exc)
         return {"detail": f"Cancel signal set for run {run_id}"}
 
     result = await db.execute(select(Run).where(Run.id == run_id))

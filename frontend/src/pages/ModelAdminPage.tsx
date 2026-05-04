@@ -4,6 +4,7 @@ import { api } from '../api/client';
 import { Loader2, Plus, Trash2, Save, GripVertical, Download, Upload, ChevronRight, ChevronLeft, Check, X } from 'lucide-react';
 import type { InputField, DockerImageSpec, Model } from '../types';
 import ModelSelector from '../components/ModelSelector';
+import ListEditor from '../components/ListEditor';
 
 /* ────── Wizard Step Component ────── */
 function WizardStep({ step, label, current }: { step: number; label: string; current: number }) {
@@ -38,7 +39,7 @@ export default function ModelAdminPage() {
         default_config: {} as Record<string, { value: unknown; type: string; description: string }>,
         docker_images: [] as DockerImageSpec[],
     });
-    const [wizardConfigEntries, setWizardConfigEntries] = useState<Array<{ key: string; value: string; type: string; description: string }>>([]);
+    const [wizardConfigEntries, setWizardConfigEntries] = useState<Array<{ key: string; value: any; type: string; description: string }>>([]);
 
     // Check mode on mount
     useEffect(() => {
@@ -96,12 +97,15 @@ export default function ModelAdminPage() {
     const [configEntries, setConfigEntries] = useState<Array<{ key: string; value: any; type: string; description: string }>>([]);
     const [configLoaded, setConfigLoaded] = useState('');
     if (model && configLoaded !== model.id) {
-        const entries = Object.entries(model.default_config || {}).map(([key, field]: [string, any]) => ({
-            key,
-            value: field.value ?? '',
-            type: field.type || 'string',
-            description: field.description || '',
-        }));
+        const entries = Object.entries(model.default_config || {}).map(([key, field]: [string, any]) => {
+            const isArray = Array.isArray(field.value);
+            return {
+                key,
+                value: isArray ? field.value : (field.value ?? ''),
+                type: isArray ? 'list' : (field.type || 'string'),
+                description: field.description || '',
+            };
+        });
         setConfigEntries(entries);
         setConfigLoaded(model.id);
     }
@@ -379,24 +383,56 @@ export default function ModelAdminPage() {
                         <div className="space-y-3">
                             {wizardConfigEntries.map((entry, idx) => (
                                 <div key={idx} className="flex gap-3 items-start p-3 rounded-lg bg-background border border-border">
-                                    <div className="flex-1 grid grid-cols-3 gap-3">
-                                        <input value={entry.key} onChange={e => {
-                                            const updated = [...wizardConfigEntries];
-                                            updated[idx] = { ...updated[idx], key: e.target.value };
-                                            setWizardConfigEntries(updated);
-                                        }} className="px-3 py-2 bg-card border border-border rounded-lg text-sm" placeholder="Config key" />
-                                        <input value={entry.value} onChange={e => {
-                                            const updated = [...wizardConfigEntries];
-                                            updated[idx] = { ...updated[idx], value: e.target.value };
-                                            setWizardConfigEntries(updated);
-                                        }} className="px-3 py-2 bg-card border border-border rounded-lg text-sm" placeholder="Value" />
-                                        <input value={entry.description} onChange={e => {
-                                            const updated = [...wizardConfigEntries];
-                                            updated[idx] = { ...updated[idx], description: e.target.value };
-                                            setWizardConfigEntries(updated);
-                                        }} className="px-3 py-2 bg-card border border-border rounded-lg text-sm" placeholder="Description" />
+                                    <div className="flex-1 space-y-2">
+                                        <div className="grid grid-cols-3 gap-3">
+                                            <input value={entry.key} onChange={e => {
+                                                const updated = [...wizardConfigEntries];
+                                                updated[idx] = { ...updated[idx], key: e.target.value };
+                                                setWizardConfigEntries(updated);
+                                            }} className="px-3 py-2 bg-card border border-border rounded-lg text-sm" placeholder="Config key" />
+                                            <select value={entry.type} onChange={e => {
+                                                const newType = e.target.value;
+                                                const updated = [...wizardConfigEntries];
+                                                updated[idx] = {
+                                                    ...updated[idx],
+                                                    type: newType,
+                                                    value: newType === 'list'
+                                                        ? (Array.isArray(entry.value) ? entry.value : [])
+                                                        : (Array.isArray(entry.value) ? '' : entry.value),
+                                                };
+                                                setWizardConfigEntries(updated);
+                                            }} className="px-3 py-2 bg-card border border-border rounded-lg text-sm">
+                                                <option value="string">String</option>
+                                                <option value="int">Integer</option>
+                                                <option value="float">Float</option>
+                                                <option value="bool">Boolean</option>
+                                                <option value="list">List</option>
+                                            </select>
+                                            <input value={entry.description} onChange={e => {
+                                                const updated = [...wizardConfigEntries];
+                                                updated[idx] = { ...updated[idx], description: e.target.value };
+                                                setWizardConfigEntries(updated);
+                                            }} className="px-3 py-2 bg-card border border-border rounded-lg text-sm" placeholder="Description" />
+                                        </div>
+                                        {entry.type === 'list' ? (
+                                            <ListEditor
+                                                items={Array.isArray(entry.value) ? entry.value.map(String) : []}
+                                                onChange={items => {
+                                                    const updated = [...wizardConfigEntries];
+                                                    updated[idx] = { ...updated[idx], value: items };
+                                                    setWizardConfigEntries(updated);
+                                                }}
+                                                placeholder="Add item and press Enter…"
+                                            />
+                                        ) : (
+                                            <input value={String(entry.value ?? '')} onChange={e => {
+                                                const updated = [...wizardConfigEntries];
+                                                updated[idx] = { ...updated[idx], value: e.target.value };
+                                                setWizardConfigEntries(updated);
+                                            }} className="w-full px-3 py-2 bg-card border border-border rounded-lg text-sm" placeholder="Value" />
+                                        )}
                                     </div>
-                                    <button onClick={() => setWizardConfigEntries(prev => prev.filter((_, i) => i !== idx))} className="p-2 text-muted-foreground hover:text-red-400"><Trash2 className="w-4 h-4" /></button>
+                                    <button onClick={() => setWizardConfigEntries(prev => prev.filter((_, i) => i !== idx))} className="p-2 text-muted-foreground hover:text-red-400 mt-1"><Trash2 className="w-4 h-4" /></button>
                                 </div>
                             ))}
                             <button onClick={() => setWizardConfigEntries(prev => [...prev, { key: '', value: '', type: 'string', description: '' }])} className="flex items-center gap-2 px-3 py-2 border border-border rounded-lg text-sm hover:bg-accent">
@@ -573,36 +609,67 @@ export default function ModelAdminPage() {
                                 <div className="bg-card border border-border rounded-xl p-6 space-y-4">
                                     {configEntries.map((entry, idx) => (
                                         <div key={idx} className="flex gap-3 items-start p-3 rounded-lg bg-background border border-border">
-                                            <div className="flex-1 grid grid-cols-3 gap-3">
-                                                <input
-                                                    type="text"
-                                                    value={entry.key}
-                                                    onChange={(e) => updateConfigEntry(idx, { key: e.target.value })}
-                                                    className="px-3 py-2 bg-card border border-border rounded-lg text-sm"
-                                                    placeholder="Config key name"
-                                                    readOnly={!isDevMode}
-                                                />
-                                                <input
-                                                    type="text"
-                                                    value={String(entry.value ?? '')}
-                                                    onChange={(e) => updateConfigEntry(idx, { value: e.target.value })}
-                                                    className="px-3 py-2 bg-card border border-border rounded-lg text-sm"
-                                                    placeholder="Value"
-                                                    readOnly={!isDevMode}
-                                                />
-                                                <input
-                                                    type="text"
-                                                    value={entry.description}
-                                                    onChange={(e) => updateConfigEntry(idx, { description: e.target.value })}
-                                                    className="px-3 py-2 bg-card border border-border rounded-lg text-sm"
-                                                    placeholder="Description"
-                                                    readOnly={!isDevMode}
-                                                />
+                                            <div className="flex-1 space-y-2">
+                                                <div className="grid grid-cols-3 gap-3">
+                                                    <input
+                                                        type="text"
+                                                        value={entry.key}
+                                                        onChange={(e) => updateConfigEntry(idx, { key: e.target.value })}
+                                                        className="px-3 py-2 bg-card border border-border rounded-lg text-sm"
+                                                        placeholder="Config key name"
+                                                        readOnly={!isDevMode}
+                                                    />
+                                                    <select
+                                                        value={entry.type}
+                                                        onChange={(e) => {
+                                                            const newType = e.target.value;
+                                                            updateConfigEntry(idx, {
+                                                                type: newType,
+                                                                value: newType === 'list'
+                                                                    ? (Array.isArray(entry.value) ? entry.value : [])
+                                                                    : (Array.isArray(entry.value) ? '' : entry.value),
+                                                            });
+                                                        }}
+                                                        className="px-3 py-2 bg-card border border-border rounded-lg text-sm"
+                                                        disabled={!isDevMode}
+                                                    >
+                                                        <option value="string">String</option>
+                                                        <option value="int">Integer</option>
+                                                        <option value="float">Float</option>
+                                                        <option value="bool">Boolean</option>
+                                                        <option value="list">List</option>
+                                                    </select>
+                                                    <input
+                                                        type="text"
+                                                        value={entry.description}
+                                                        onChange={(e) => updateConfigEntry(idx, { description: e.target.value })}
+                                                        className="px-3 py-2 bg-card border border-border rounded-lg text-sm"
+                                                        placeholder="Description"
+                                                        readOnly={!isDevMode}
+                                                    />
+                                                </div>
+                                                {entry.type === 'list' ? (
+                                                    <ListEditor
+                                                        items={Array.isArray(entry.value) ? entry.value.map(String) : []}
+                                                        onChange={(items) => updateConfigEntry(idx, { value: items })}
+                                                        readOnly={!isDevMode}
+                                                        placeholder="Add item and press Enter…"
+                                                    />
+                                                ) : (
+                                                    <input
+                                                        type="text"
+                                                        value={String(entry.value ?? '')}
+                                                        onChange={(e) => updateConfigEntry(idx, { value: e.target.value })}
+                                                        className="w-full px-3 py-2 bg-card border border-border rounded-lg text-sm"
+                                                        placeholder="Value"
+                                                        readOnly={!isDevMode}
+                                                    />
+                                                )}
                                             </div>
                                             {isDevMode && (
                                                 <button
                                                     onClick={() => removeConfigEntry(idx)}
-                                                    className="p-2 text-muted-foreground hover:text-red-400 transition-colors"
+                                                    className="p-2 text-muted-foreground hover:text-red-400 transition-colors mt-1"
                                                 >
                                                     <Trash2 className="w-4 h-4" />
                                                 </button>

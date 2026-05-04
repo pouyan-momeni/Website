@@ -297,25 +297,25 @@ async def export_model(
     """Export a model's full settings as JSON. Available to all authenticated users."""
     if settings.is_develop:
         model_data = _DEV_MODELS.get(str(model_id))
-        if not model_data:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
-        export = {
-            "name": model_data["name"],
-            "slug": model_data["slug"],
-            "description": model_data.get("description"),
-            "input_schema": model_data.get("input_schema", []),
-            "default_config": model_data.get("default_config", {}),
-            "docker_images": model_data.get("docker_images", []),
-        }
-        from backend.api.audit import log_action
-        await log_action(
-            username=getattr(current_user, 'ldap_username', 'admin'),
-            user_id=str(getattr(current_user, 'id', '')),
-            action="export_model", resource_type="model", resource_id=str(model_id),
-            details={"model_name": model_data["name"]},
-            db=None,
-        )
-        return export
+        if model_data:
+            export = {
+                "name": model_data["name"],
+                "slug": model_data["slug"],
+                "description": model_data.get("description"),
+                "input_schema": model_data.get("input_schema", []),
+                "default_config": model_data.get("default_config", {}),
+                "docker_images": model_data.get("docker_images", []),
+            }
+            from backend.api.audit import log_action
+            await log_action(
+                username=getattr(current_user, 'ldap_username', 'admin'),
+                user_id=str(getattr(current_user, 'id', '')),
+                action="export_model", resource_type="model", resource_id=str(model_id),
+                details={"model_name": model_data["name"]},
+                db=None,
+            )
+            return export
+        # Fall through to DB for models created via UI
 
     result = await db.execute(select(Model).where(Model.id == model_id))
     model = result.scalar_one_or_none()

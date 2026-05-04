@@ -7,6 +7,7 @@ import {
     Loader2, Play, ChevronDown, ChevronRight, Upload, Clock, Calendar,
     Repeat, Cpu, HardDrive, Database, AlertCircle,
 } from 'lucide-react';
+import ListEditor from '../components/ListEditor';
 
 export default function ModelRunPage() {
     useAuthStore();
@@ -15,7 +16,7 @@ export default function ModelRunPage() {
     const [inputs, setInputs] = useState<Record<string, string>>({});
     const [uploadingFields, setUploadingFields] = useState<Record<string, boolean>>({});
     const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({});
-    const [configOverride, setConfigOverride] = useState<Record<string, string>>({});
+    const [configOverride, setConfigOverride] = useState<Record<string, any>>({});
     const [configOpen, setConfigOpen] = useState(false);
     const [submitted, setSubmitted] = useState(false);
 
@@ -295,23 +296,37 @@ export default function ModelRunPage() {
                             </button>
                             {configOpen && (
                                 <div className="p-6 pt-0 space-y-4 border-t border-border">
-                                    {Object.entries(defaultConfig).map(([key, field]: [string, any]) => (
-                                        <div key={key}>
-                                            <label className="block text-sm font-medium mb-1.5">
-                                                {key}
-                                                <span className="text-xs text-muted-foreground ml-2">({field.type})</span>
-                                            </label>
-                                            <input
-                                                type="text"
-                                                value={configOverride[key] ?? String(field.value ?? '')}
-                                                onChange={(e) => setConfigOverride(prev => ({ ...prev, [key]: e.target.value }))}
-                                                className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                                            />
-                                            {field.description && (
-                                                <p className="text-xs text-muted-foreground mt-1">{field.description}</p>
-                                            )}
-                                        </div>
-                                    ))}
+                                    {Object.entries(defaultConfig).map(([key, field]: [string, any]) => {
+                                        const isList = field.type === 'list' || Array.isArray(field.value);
+                                        const currentVal = configOverride[key] !== undefined
+                                            ? configOverride[key]
+                                            : (isList ? (Array.isArray(field.value) ? field.value : []) : (field.value ?? ''));
+                                        return (
+                                            <div key={key}>
+                                                <label className="block text-sm font-medium mb-1.5">
+                                                    {key}
+                                                    <span className="text-xs text-muted-foreground ml-2">({isList ? 'list' : field.type})</span>
+                                                </label>
+                                                {isList ? (
+                                                    <ListEditor
+                                                        items={Array.isArray(currentVal) ? currentVal.map(String) : []}
+                                                        onChange={(items) => setConfigOverride(prev => ({ ...prev, [key]: items }))}
+                                                        placeholder="Add value and press Enter…"
+                                                    />
+                                                ) : (
+                                                    <input
+                                                        type="text"
+                                                        value={String(currentVal)}
+                                                        onChange={(e) => setConfigOverride(prev => ({ ...prev, [key]: e.target.value }))}
+                                                        className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                                                    />
+                                                )}
+                                                {field.description && (
+                                                    <p className="text-xs text-muted-foreground mt-1">{field.description}</p>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
                                     {Object.keys(defaultConfig).length === 0 && (
                                         <p className="text-sm text-muted-foreground">No configuration options available.</p>
                                     )}
