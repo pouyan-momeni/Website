@@ -138,6 +138,10 @@ class ApiClient {
     }
 
     // Runs
+    async getInputCache(modelId: string): Promise<Record<string, string[]>> {
+        return this.request(`/runs/input-cache/${modelId}`);
+    }
+
     async createRun(data: { model_id: string; inputs: Record<string, unknown>; config_override: Record<string, unknown> }): Promise<Run> {
         return this.request('/runs', { method: 'POST', body: JSON.stringify(data) });
     }

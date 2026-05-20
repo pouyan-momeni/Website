@@ -46,6 +46,13 @@ export default function ModelRunPage() {
         queryFn: () => api.getModels(),
     });
 
+    // Fetch cached input values for the selected model (for autocomplete suggestions)
+    const { data: inputCache } = useQuery({
+        queryKey: ['input-cache', selectedModelId],
+        queryFn: () => api.getInputCache(selectedModelId),
+        enabled: !!selectedModelId,
+    });
+
     // Auto-select first model
     useEffect(() => {
         if (models && models.length > 0 && !selectedModelId) {
@@ -245,36 +252,69 @@ export default function ModelRunPage() {
                                                     )}
                                                 </div>
                                             ) : field.type === 'file' ? (
-                                                <input
-                                                    type="text"
-                                                    value={inputs[field.name] || ''}
-                                                    onChange={(e) => setInputs(prev => ({ ...prev, [field.name]: e.target.value }))}
-                                                    className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                                                    placeholder={`Server path for ${field.name}`}
-                                                />
+                                                <>
+                                                    <input
+                                                        type="text"
+                                                        value={inputs[field.name] || ''}
+                                                        onChange={(e) => setInputs(prev => ({ ...prev, [field.name]: e.target.value }))}
+                                                        className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                                                        placeholder={`Server path for ${field.name}`}
+                                                        list={`cache-${field.name}`}
+                                                    />
+                                                    {inputCache?.[field.name]?.length ? (
+                                                        <datalist id={`cache-${field.name}`}>
+                                                            {inputCache[field.name].map((v) => <option key={v} value={v} />)}
+                                                        </datalist>
+                                                    ) : null}
+                                                </>
                                             ) : field.type === 'date' ? (
-                                                <input
-                                                    type="date"
-                                                    value={inputs[field.name] || ''}
-                                                    onChange={(e) => setInputs(prev => ({ ...prev, [field.name]: e.target.value }))}
-                                                    className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                                                />
+                                                <>
+                                                    <input
+                                                        type="text"
+                                                        value={inputs[field.name] || ''}
+                                                        onChange={(e) => setInputs(prev => ({ ...prev, [field.name]: e.target.value }))}
+                                                        className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                                                        placeholder="YYYY-MM-DD"
+                                                        list={`cache-${field.name}`}
+                                                    />
+                                                    {inputCache?.[field.name]?.length ? (
+                                                        <datalist id={`cache-${field.name}`}>
+                                                            {inputCache[field.name].map((v) => <option key={v} value={v} />)}
+                                                        </datalist>
+                                                    ) : null}
+                                                </>
                                             ) : field.type === 'number' ? (
-                                                <input
-                                                    type="number"
-                                                    value={inputs[field.name] || ''}
-                                                    onChange={(e) => setInputs(prev => ({ ...prev, [field.name]: e.target.value }))}
-                                                    className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                                                    placeholder={`Enter ${field.name}`}
-                                                />
+                                                <>
+                                                    <input
+                                                        type="text"
+                                                        value={inputs[field.name] || ''}
+                                                        onChange={(e) => setInputs(prev => ({ ...prev, [field.name]: e.target.value }))}
+                                                        className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                                                        placeholder={`Enter ${field.name}`}
+                                                        list={`cache-${field.name}`}
+                                                    />
+                                                    {inputCache?.[field.name]?.length ? (
+                                                        <datalist id={`cache-${field.name}`}>
+                                                            {inputCache[field.name].map((v) => <option key={v} value={v} />)}
+                                                        </datalist>
+                                                    ) : null}
+                                                </>
                                             ) : (
-                                                <input
-                                                    type="text"
-                                                    value={inputs[field.name] || ''}
-                                                    onChange={(e) => setInputs(prev => ({ ...prev, [field.name]: e.target.value }))}
-                                                    className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
-                                                    placeholder={`Enter ${field.name}`}
-                                                />
+                                                <>
+                                                    <input
+                                                        type="text"
+                                                        value={inputs[field.name] || ''}
+                                                        onChange={(e) => setInputs(prev => ({ ...prev, [field.name]: e.target.value }))}
+                                                        className="w-full px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                                                        placeholder={`Enter ${field.name}`}
+                                                        list={`cache-${field.name}`}
+                                                    />
+                                                    {inputCache?.[field.name]?.length ? (
+                                                        <datalist id={`cache-${field.name}`}>
+                                                            {inputCache[field.name].map((v) => <option key={v} value={v} />)}
+                                                        </datalist>
+                                                    ) : null}
+                                                </>
                                             )}
                                             <p className="text-xs text-muted-foreground mt-1">
                                                 Type: {field.type}{field.source ? ` · Source: ${field.source}` : ''}

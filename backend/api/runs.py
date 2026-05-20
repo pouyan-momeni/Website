@@ -12,6 +12,8 @@ import uuid as uuid_mod
 import threading
 import time
 
+import yaml
+
 import psutil
 from datetime import datetime, timezone
 from typing import Optional
@@ -837,6 +839,52 @@ async def upload_temp_file(
     return {"temp_path": temp_path, "filename": safe_name}
 
 
+@router.get("/input-cache/{model_id}")
+async def get_input_cache(
+    model_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return previously used input values for each field of a model, for autocomplete suggestions."""
+    str_model_id = str(model_id)
+    cache: dict[str, list[str]] = {}
+
+    if settings.is_develop:
+        for run in _DEV_RUNS.values():
+            if run.get("model_id") != str_model_id:
+                continue
+            run_inputs = run.get("inputs", {})
+            if not run_inputs:
+                continue
+            for key, value in run_inputs.items():
+                if value is None:
+                    continue
+                str_val = str(value)
+                if not str_val:
+                    continue
+                cache.setdefault(key, [])
+                if str_val not in cache[key]:
+                    cache[key].append(str_val)
+    else:
+        db_result = await db.execute(
+            select(Run.inputs).where(Run.model_id == model_id).where(Run.inputs.isnot(None))
+        )
+        for (run_inputs,) in db_result:
+            if not run_inputs:
+                continue
+            for key, value in run_inputs.items():
+                if value is None:
+                    continue
+                str_val = str(value)
+                if not str_val:
+                    continue
+                cache.setdefault(key, [])
+                if str_val not in cache[key]:
+                    cache[key].append(str_val)
+
+    return cache
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_run(
     body: RunCreate,
@@ -904,6 +952,21 @@ async def create_run(
         # Write all inputs as JSON for reference
         with open(os.path.join(inputs_path, "inputs.json"), "w") as _f:
             json.dump(resolved_inputs, _f, indent=2, default=str)
+
+        # Write config as YAML file in inputs folder
+        # Extract plain values: lists stay as lists, everything else becomes string
+        config_for_yaml = {}
+        for key, entry in default_config.items():
+            if isinstance(entry, dict) and "value" in entry:
+                val = entry["value"]
+            else:
+                val = entry
+            if isinstance(val, list):
+                config_for_yaml[key] = [str(item) for item in val]
+            else:
+                config_for_yaml[key] = str(val)
+        with open(os.path.join(inputs_path, "config.yml"), "w") as _f:
+            yaml.dump(config_for_yaml, _f, default_flow_style=False, sort_keys=False)
 
         run = {
             "id": run_id,
