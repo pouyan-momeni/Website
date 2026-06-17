@@ -504,8 +504,8 @@ def _run_model(run_id: str):
         inputs_path = run.get("inputs_path", os.path.join(settings.RUNS_BASE_PATH, run_id, "inputs"))
         os.makedirs(inputs_path, exist_ok=True)
 
-        # Get run inputs for variable substitution
-        run_inputs = run.get("inputs", {})
+        # Get resolved inputs for variable substitution (file paths already copied)
+        run_inputs = run.get("resolved_inputs", run.get("inputs", {}))
 
         # Add platform paths so $IF / $OF resolve in extra_args
         substitution_inputs = dict(run_inputs)
@@ -516,12 +516,14 @@ def _run_model(run_id: str):
         # WebSocket (which polls _DEV_LOGS) streams logs live while Docker runs.
         import redis as _sync_redis
         _fwd_stop = threading.Event()
+        _fwd_ready = threading.Event()
 
         def _redis_to_dev_logs():
             try:
                 _r = _sync_redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
                 _ps = _r.pubsub()
                 _ps.subscribe(f"run:{run_id}:logs")
+                _fwd_ready.set()
                 while not _fwd_stop.is_set():
                     msg = _ps.get_message(ignore_subscribe_messages=True, timeout=0.05)
                     if msg and msg["type"] == "message":
@@ -530,10 +532,11 @@ def _run_model(run_id: str):
                 _ps.close()
                 _r.close()
             except Exception:
-                pass
+                _fwd_ready.set()
 
         _fwd_thread = threading.Thread(target=_redis_to_dev_logs, daemon=True)
         _fwd_thread.start()
+        _fwd_ready.wait(timeout=3)
 
         try:
             for idx, img_spec in enumerate(docker_images):
@@ -917,6 +920,9 @@ async def create_run(
         os.makedirs(log_path, exist_ok=True)
         os.makedirs(inputs_path, exist_ok=True)
 
+        # Keep the original inputs the user typed (for display in run history)
+        original_inputs = dict(body.inputs)
+
         # ── Resolve file-type inputs ──────────────────────────────────────────
         resolved_inputs = dict(body.inputs)
         input_schema = _get_model_input_schema(model_id)
@@ -973,7 +979,8 @@ async def create_run(
             "model_id": model_id,
             "triggered_by": str(current_user.id),
             "status": "queued",
-            "inputs": resolved_inputs,
+            "inputs": original_inputs,
+            "resolved_inputs": resolved_inputs,
             "config_snapshot": default_config,
             "celery_task_id": None,
             "current_container_index": 0,

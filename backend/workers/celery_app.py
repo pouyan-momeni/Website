@@ -19,6 +19,9 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
 
+    # Beat schedule file — use /tmp to avoid permission issues in Docker
+    beat_schedule_filename="/tmp/celerybeat-schedule",
+
     # Worker settings
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=100,
